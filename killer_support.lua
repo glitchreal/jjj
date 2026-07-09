@@ -11,7 +11,7 @@ local SCRIPT_PATH = "/scripts/killer.json"
 local POLL_SECONDS = 4
 local AFTER_JOIN_SETTLE_SECONDS = 8
 local KILL_CHECK_SECONDS = 2
-local STALE_AFTER_SECONDS = 240
+local STALE_AFTER_SECONDS = 900
 local KILLER_NAME = Players.LocalPlayer and Players.LocalPlayer.Name or "killer"
 
 local httpRequest = request or http_request or (syn and syn.request)
@@ -87,16 +87,13 @@ local function getOldestSpawnedJob()
         local sameServer = job.jobId == game.JobId
         local validPlace = tonumber(job.placeId) == game.PlaceId
 
-        if validPlace and not sameServer and age <= STALE_AFTER_SECONDS then
+        if validPlace and not sameServer and age >= 0 and age <= STALE_AFTER_SECONDS then
             if not bestJob or tonumber(job.createdAt or 0) < tonumber(bestJob.createdAt or 0) then
                 bestKey = key
                 bestJob = job
             end
         elseif age > STALE_AFTER_SECONDS then
-            firebase("PATCH", "/jobs/" .. key .. ".json", {
-                status = "expired",
-                updatedAt = now(),
-            })
+            print("Ignoring stale Vicious job:", key, "age:", age, "jobId:", tostring(job.jobId))
         end
     end
 
