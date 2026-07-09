@@ -3,17 +3,25 @@
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
 
 local DATABASE_URL = "https://bss-job-queue-7bf75-default-rtdb.firebaseio.com"
 local POLL_SECONDS = 2
 local HEARTBEAT_SECONDS = 10
+local EMPTY_SERVER_SCAN_SECONDS = 12
+local AFTER_KILL_HOP_SECONDS = 5
+local HOP_DELAY_MIN_SECONDS = 2
+local HOP_DELAY_MAX_SECONDS = 6
 local SOURCE_NAME = Players.LocalPlayer and Players.LocalPlayer.Name or "searcher"
+local PLAYER = Players.LocalPlayer
 
 local httpRequest = request or http_request or (syn and syn.request)
 assert(type(httpRequest) == "function", "No executor HTTP request function found")
 
 local lastSeen = false
 local lastHeartbeat = 0
+local startedAt = os.time()
+local hopping = false
 
 local function now()
     return os.time()
@@ -75,6 +83,27 @@ local function jobPath()
     return "/jobs/" .. game.JobId .. ".json"
 end
 
+local function hopServer(reason)
+    if hopping then
+        return
+    end
+
+    hopping = true
+    local delaySeconds = math.random(HOP_DELAY_MIN_SECONDS, HOP_DELAY_MAX_SECONDS)
+    print("Searcher server hopping:", reason, "in", delaySeconds, "seconds")
+    task.wait(delaySeconds)
+
+    local ok, err = pcall(function()
+        TeleportService:Teleport(game.PlaceId, PLAYER)
+    end)
+
+    if not ok then
+        warn("Searcher server hop failed:", tostring(err))
+        hopping = false
+        startedAt = now()
+    end
+end
+
 local function postSpawned(fullName)
     local timestamp = now()
     local existing = firebase("GET", jobPath())
@@ -126,6 +155,8 @@ while task.wait(POLL_SECONDS) do
         postSpawned(fullName)
     elseif not exists and lastSeen then
         markKilled()
+        task.wait(AFTER_KILL_HOP_SECONDS)
+        hopServer("Vicious is gone")
     elseif exists and (now() - lastHeartbeat) >= HEARTBEAT_SECONDS then
         local timestamp = now()
         local existing = firebase("GET", jobPath())
@@ -147,6 +178,8 @@ while task.wait(POLL_SECONDS) do
         end
 
         lastHeartbeat = timestamp
+    elseif not exists and (now() - startedAt) >= EMPTY_SERVER_SCAN_SECONDS then
+        hopServer("No Vicious found")
     end
 
     lastSeen = exists
