@@ -79,6 +79,19 @@ local function postSpawned(fullName)
     local timestamp = now()
     local existing = firebase("GET", jobPath())
     local createdAt = existing and tonumber(existing.createdAt) or timestamp
+    local existingStatus = existing and tostring(existing.status) or nil
+
+    if existingStatus == "claimed" then
+        firebase("PATCH", jobPath(), {
+            updatedAt = timestamp,
+            source = SOURCE_NAME,
+            note = fullName or "Vicious Bee detected",
+        })
+
+        lastHeartbeat = timestamp
+        print("Vicious JobId already claimed:", game.JobId)
+        return
+    end
 
     firebase("PUT", jobPath(), {
         placeId = game.PlaceId,
@@ -115,12 +128,24 @@ while task.wait(POLL_SECONDS) do
         markKilled()
     elseif exists and (now() - lastHeartbeat) >= HEARTBEAT_SECONDS then
         local timestamp = now()
-        firebase("PATCH", jobPath(), {
-            status = "spawned",
-            updatedAt = timestamp,
-            source = SOURCE_NAME,
-            note = fullName or "Vicious Bee detected",
-        })
+        local existing = firebase("GET", jobPath())
+        local existingStatus = existing and tostring(existing.status) or nil
+
+        if existingStatus == "claimed" then
+            firebase("PATCH", jobPath(), {
+                updatedAt = timestamp,
+                source = SOURCE_NAME,
+                note = fullName or "Vicious Bee detected",
+            })
+        else
+            firebase("PATCH", jobPath(), {
+                status = "spawned",
+                updatedAt = timestamp,
+                source = SOURCE_NAME,
+                note = fullName or "Vicious Bee detected",
+            })
+        end
+
         lastHeartbeat = timestamp
     end
 
