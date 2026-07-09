@@ -6,13 +6,14 @@ local Players = game:GetService("Players")
 
 local DATABASE_URL = "https://bss-job-queue-7bf75-default-rtdb.firebaseio.com"
 local POLL_SECONDS = 2
+local HEARTBEAT_SECONDS = 10
 local SOURCE_NAME = Players.LocalPlayer and Players.LocalPlayer.Name or "searcher"
 
 local httpRequest = request or http_request or (syn and syn.request)
 assert(type(httpRequest) == "function", "No executor HTTP request function found")
 
-local activeFirebaseKey = nil
 local lastSeen = false
+local lastHeartbeat = 0
 
 local function now()
     return os.time()
@@ -70,36 +71,37 @@ local function viciousExists()
     return false, nil
 end
 
+local function jobPath()
+    return "/jobs/" .. game.JobId .. ".json"
+end
+
 local function postSpawned(fullName)
     local timestamp = now()
-    local result = firebase("POST", "/jobs.json", {
+    local existing = firebase("GET", jobPath())
+    local createdAt = existing and tonumber(existing.createdAt) or timestamp
+
+    firebase("PUT", jobPath(), {
         placeId = game.PlaceId,
         jobId = game.JobId,
         status = "spawned",
-        createdAt = timestamp,
+        createdAt = createdAt,
         updatedAt = timestamp,
         source = SOURCE_NAME,
         note = fullName or "Vicious Bee detected",
     })
 
-    if result and result.name then
-        activeFirebaseKey = result.name
-        print("Posted Vicious JobId:", game.JobId, "firebaseKey:", activeFirebaseKey)
-    end
+    lastHeartbeat = timestamp
+    print("Posted Vicious JobId:", game.JobId)
 end
 
 local function markKilled()
-    if not activeFirebaseKey then
-        return
-    end
-
-    firebase("PATCH", "/jobs/" .. activeFirebaseKey .. ".json", {
+    firebase("PATCH", jobPath(), {
         status = "killed",
         updatedAt = now(),
+        source = SOURCE_NAME,
     })
 
-    print("Marked Vicious killed:", activeFirebaseKey)
-    activeFirebaseKey = nil
+    print("Marked Vicious killed:", game.JobId)
 end
 
 print("Searcher support running for JobId:", game.JobId)
@@ -111,10 +113,15 @@ while task.wait(POLL_SECONDS) do
         postSpawned(fullName)
     elseif not exists and lastSeen then
         markKilled()
-    elseif exists and activeFirebaseKey then
-        firebase("PATCH", "/jobs/" .. activeFirebaseKey .. ".json", {
-            updatedAt = now(),
+    elseif exists and (now() - lastHeartbeat) >= HEARTBEAT_SECONDS then
+        local timestamp = now()
+        firebase("PATCH", jobPath(), {
+            status = "spawned",
+            updatedAt = timestamp,
+            source = SOURCE_NAME,
+            note = fullName or "Vicious Bee detected",
         })
+        lastHeartbeat = timestamp
     end
 
     lastSeen = exists

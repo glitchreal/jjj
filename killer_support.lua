@@ -7,7 +7,6 @@ local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
 
 local DATABASE_URL = "https://bss-job-queue-7bf75-default-rtdb.firebaseio.com"
-local SCRIPT_PATH = "/scripts/killer.json"
 local POLL_SECONDS = 4
 local AFTER_JOIN_SETTLE_SECONDS = 8
 local KILL_CHECK_SECONDS = 2
@@ -107,48 +106,12 @@ local function markJob(key, status, extra)
     firebase("PATCH", "/jobs/" .. key .. ".json", payload)
 end
 
-local function queueAfterTeleport(jobKey)
-    if typeof(queue_on_teleport) ~= "function" then
-        warn("queue_on_teleport is not available; re-run killer_support.lua after teleport")
-        return
-    end
-
-    local code = string.format([[
-        local HttpService = game:GetService("HttpService")
-        local DATABASE_URL = %q
-        local JOB_KEY = %q
-        local SCRIPT_PATH = %q
-        local httpRequest = request or http_request or (syn and syn.request)
-
-        if type(getgenv) == "function" then
-            getgenv().BSS_KILLER_ACTIVE_JOB = JOB_KEY
-        end
-
-        task.wait(1)
-        local response = httpRequest({
-            Url = DATABASE_URL .. SCRIPT_PATH,
-            Method = "GET",
-            Headers = { ["Content-Type"] = "application/json" },
-        })
-
-        local source = HttpService:JSONDecode(response.Body or response.body or "null")
-        if type(source) ~= "string" then
-            warn("Could not reload killer script from Firebase")
-            return
-        end
-
-        loadstring(source)()
-    ]], DATABASE_URL, jobKey, SCRIPT_PATH)
-
-    queue_on_teleport(code)
-end
-
 print("Killer support running from JobId:", game.JobId)
 
-local activeJobKey = type(getgenv) == "function" and getgenv().BSS_KILLER_ACTIVE_JOB or nil
-if activeJobKey then
-    print("Resumed killer support for firebaseKey:", activeJobKey)
-    markJob(activeJobKey, "claimed", {
+local currentJob = firebase("GET", "/jobs/" .. game.JobId .. ".json")
+if currentJob and currentJob.status == "claimed" then
+    print("Resumed claimed Vicious job in current server:", game.JobId)
+    markJob(game.JobId, "claimed", {
         killer = KILLER_NAME,
         joinedJobId = game.JobId,
     })
@@ -158,16 +121,12 @@ if activeJobKey then
     while task.wait(KILL_CHECK_SECONDS) do
         local exists = viciousExists()
         if not exists then
-            markJob(activeJobKey, "killed", {
+            markJob(game.JobId, "killed", {
                 killer = KILLER_NAME,
                 killedInJobId = game.JobId,
             })
 
-            if type(getgenv) == "function" then
-                getgenv().BSS_KILLER_ACTIVE_JOB = nil
-            end
-
-            print("Marked Vicious killed for job:", activeJobKey)
+            print("Marked Vicious killed for job:", game.JobId)
             break
         end
     end
@@ -183,7 +142,6 @@ while task.wait(POLL_SECONDS) do
             claimedAt = now(),
         })
 
-        queueAfterTeleport(key)
         task.wait(1)
 
         TeleportService:TeleportToPlaceInstance(tonumber(job.placeId), tostring(job.jobId), Players.LocalPlayer)

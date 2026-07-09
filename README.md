@@ -4,6 +4,7 @@ Two-script Firebase queue for coordinating Vicious Bee servers.
 
 - `searcher_support.lua` runs on support/searcher accounts. It watches `Workspace.Monsters` for a live Vicious Bee and posts the current `JobId` to Firebase.
 - `killer_support.lua` runs on the killer account. It polls Firebase for spawned Vicious jobs, joins the server, waits until the Vicious Bee is gone, marks the job killed, and keeps polling.
+- The queue stores jobs by JobId, so multiple searchers in the same server update one shared entry instead of creating duplicates.
 
 ## Loaders
 
@@ -19,6 +20,8 @@ Run this on the killer account:
 loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
 ```
 
+For server hopping searchers, put the loader in your executor autoexecute folder so it starts again after every teleport.
+
 ## Firebase
 
 Database URL:
@@ -27,7 +30,7 @@ Database URL:
 https://bss-job-queue-7bf75-default-rtdb.firebaseio.com
 ```
 
-The database stores queue entries under `/jobs`.
+The database stores queue entries under `/jobs/<JobId>`.
 
 Job statuses:
 
