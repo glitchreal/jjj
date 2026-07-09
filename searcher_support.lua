@@ -93,7 +93,7 @@ local function postSpawned(fullName)
         return
     end
 
-    firebase("PUT", jobPath(), {
+    firebase("PATCH", jobPath(), {
         placeId = game.PlaceId,
         jobId = game.JobId,
         status = "spawned",
