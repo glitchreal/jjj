@@ -23,6 +23,21 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/k
 
 For searchers, put the loader in your executor autoexecute folder so it starts again after every teleport.
 
+## Killer Tracker And Webhook
+
+The killer script includes a compact Vichop tracker. It shows total and current-session kills, stingers gained, joined servers, and session uptime. When the executor supports the `Drawing` API, the tracker appears in the upper-left; otherwise the same events are shown through Roblox notifications and the executor console.
+
+Totals are saved locally as `vichop_stats.json`, so they carry on through teleports and executor restarts. Stingers are measured from the killer's `CoreStats.Stingers` value before and shortly after each confirmed Vicious kill.
+
+To enable Discord reports without exposing the URL on GitHub, use this killer loader instead:
+
+```lua
+getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
+loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
+```
+
+Every confirmed kill sends one embed with the stingers gained, session totals, lifetime totals, and a shortened server ID. Keep a webhook URL private: anyone who has it can post messages to that channel.
+
 ## Firebase
 
 Database URL:
