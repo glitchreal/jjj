@@ -12,12 +12,14 @@ Two-script Firebase queue for coordinating Vicious Bee servers.
 Run this on each searcher/support account:
 
 ```lua
+repeat wait() until game:IsLoaded() and game.Players.LocalPlayer 
 loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
 ```
 
 Run this on the killer account:
 
 ```lua
+repeat wait() until game:IsLoaded() and game.Players.LocalPlayer 
 loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
 ```
 
@@ -33,6 +35,7 @@ To enable Discord reports without exposing the URL on GitHub, use this killer lo
 
 ```lua
 getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
+repeat wait() until game:IsLoaded() and game.Players.LocalPlayer 
 loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
 ```
 
