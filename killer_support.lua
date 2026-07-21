@@ -6,6 +6,7 @@ local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
 local StarterGui = game:GetService("StarterGui")
 
+local BSS_PLACE_ID = 1537690962
 local DATABASE_URL = "https://bss-job-queue-7bf75-default-rtdb.firebaseio.com"
 local STATS_FILE = "vichop_stats.json"
 local QUEUE_POLL_SECONDS = 0.75
@@ -24,6 +25,10 @@ local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_RETRIES = 3
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
+
+if game.PlaceId ~= BSS_PLACE_ID then
+    return
+end
 
 local playerDeadline = os.clock() + 30
 while not Players.LocalPlayer and os.clock() < playerDeadline do
