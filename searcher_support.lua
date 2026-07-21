@@ -18,6 +18,7 @@ local OWN_RECENT_TTL_SECONDS = 10 * 60
 local FLEET_RECENT_TTL_SECONDS = 45
 local JOB_STALE_SECONDS = 35
 local CLEANUP_INTERVAL_SECONDS = 30
+local HTTP_TIMEOUT_SECONDS = 15
 local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_BACKOFF_MAX_SECONDS = 3
 local CANDIDATE_TTL_SECONDS = 3 * 60
@@ -81,6 +82,7 @@ local runtime = {
     teleportStarted = false,
     teleportError = nil,
     currentReservationOwned = false,
+    currentReservationFailures = 0,
     cleanupRunning = false,
     previousJobId = "",
     expectedJobId = "",
@@ -237,6 +239,7 @@ local function responseHeader(response, wantedName)
 end
 
 local function rawRequest(options)
+    options.Timeout = options.Timeout or HTTP_TIMEOUT_SECONDS
     runtime.httpRequests = runtime.httpRequests + 1
     local ok, response = pcall(httpRequest, options)
     runtime.httpRequests = math.max(0, runtime.httpRequests - 1)
@@ -689,7 +692,7 @@ local function ensureNextHop()
     end
     runtime.preparing = true
     task.spawn(function()
-        runBackground("destination preparation", function()
+        local backgroundOk = runBackground("destination preparation", function()
             while runtimeIsCurrent() and not runtime.stopBackground and not runtime.holdPosition
                 and not runtime.nextHop do
                 local prepared = prepareFromCandidatePool()
@@ -703,6 +706,11 @@ local function ensureNextHop()
             end
         end)
         runtime.preparing = false
+        runtime.refillRunning = false
+        if not backgroundOk and runtimeIsCurrent() and not runtime.stopBackground then
+            task.wait(REFILL_RETRY_SECONDS)
+            ensureNextHop()
+        end
     end)
 end
 
@@ -1181,10 +1189,17 @@ local function runSearcher()
                 runBackground("reservation heartbeat", function()
                     if runtime.currentReservationOwned then
                         local heartbeatOk = heartbeatReservation(game.JobId)
-                        if not heartbeatOk then
+                        if heartbeatOk then
+                            runtime.currentReservationFailures = 0
+                        else
+                            runtime.currentReservationFailures = runtime.currentReservationFailures + 1
+                        end
+                        if not heartbeatOk and runtime.currentReservationFailures >= 2 then
                             runtime.currentReservationOwned = false
                             warn("[Vichop/Searcher] Lost this server reservation")
                             requestHop("current reservation lease lost")
+                        elseif not heartbeatOk then
+                            warn("[Vichop/Searcher] Reservation heartbeat failed; retrying before leaving")
                         end
                     end
                     local prepared = runtime.nextHop
