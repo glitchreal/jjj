@@ -29,6 +29,27 @@
         ".write": "!newData.exists() || (newData.hasChildren(['searcherId', 'checkedAt', 'placeId']) && newData.child('searcherId').isString() && newData.child('checkedAt').isNumber() && newData.child('placeId').isNumber())"
       }
     },
+    "candidatePool": {
+      ".read": true,
+      "$job": {
+        ".write": "!newData.exists() || (newData.hasChildren(['jobId', 'placeId', 'playing', 'maxPlayers', 'discoveredAt', 'discoveredBy']) && newData.child('jobId').isString() && newData.child('placeId').isNumber() && newData.child('playing').isNumber() && newData.child('maxPlayers').isNumber() && newData.child('discoveredAt').isNumber() && newData.child('discoveredBy').isString())"
+      }
+    },
+    "candidatePoolMeta": {
+      ".read": true,
+      "refillLease": {
+        ".write": "!newData.exists() || (newData.hasChildren(['searcherId', 'leaseId', 'acquiredAt', 'heartbeatAt', 'expiresAt']) && newData.child('searcherId').isString() && newData.child('leaseId').isString() && newData.child('acquiredAt').isNumber() && newData.child('heartbeatAt').isNumber() && newData.child('expiresAt').isNumber())"
+      },
+      "cooldownUntil": {
+        ".write": "!newData.exists() || newData.isNumber()"
+      },
+      "nextCursor": {
+        ".write": "!newData.exists() || newData.isString()"
+      },
+      "lastRefillAt": {
+        ".write": "!newData.exists() || newData.isNumber()"
+      }
+    },
     "scripts": {
       ".read": true,
       ".write": false
