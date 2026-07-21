@@ -93,7 +93,7 @@ end
 
 local currentJobEventId = nil
 local lastJobHeartbeat = 0
-local lastCleanup = 0
+local lastCleanup = os.time()
 local serverStartedAtClock = os.clock()
 
 local function now()
@@ -509,7 +509,7 @@ local function hopServer(reason, requestedAt)
 
     if runtime.currentReservationOwned then
         runtime.currentReservationOwned = false
-        task.spawn(releaseReservation, game.JobId)
+        releaseReservation(game.JobId)
     end
 
     if runtime.rehopCount >= COLLISION_JITTER_AFTER then
@@ -698,7 +698,6 @@ local function runSearcher()
     if not arrivedValid then
         runtime.rehopCount = runtime.rehopCount + 1
         print("[Vichop/Searcher] Rehopping immediately:", arrivalReason)
-        task.spawn(releaseReservation, game.JobId)
         requestHop("arrival rejected: " .. arrivalReason, true)
         while runtimeIsCurrent() do
             task.wait(SCAN_INTERVAL_SECONDS)

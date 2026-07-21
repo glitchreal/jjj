@@ -87,7 +87,7 @@ No player, teleport payload, or destination `ServerInstanceId` is supplied, so R
 
 The local resume file carries the previous `JobId`, stable searcher ID, and repeated-rehop count. After arrival, the script rejects the server immediately when matchmaking returned the previous `JobId`, the account or fleet checked it recently, Firebase history is unavailable, or another active searcher wins its ETag reservation. Only a valid reservation starts the normal five-second Vicious scan and heartbeat.
 
-The no-Vicious critical path saves the resume context locally and calls generic matchmaking immediately. The console reports precise decision-to-teleport-call latency. Teleport initialization failures use one persistent controller with capped short backoff; it never gives up after a fixed retry count. A small randomized delay applies only after three consecutive invalid arrivals, reducing repeated matchmaking collisions without slowing normal hops.
+The no-Vicious critical path stops reservation work, saves the resume context locally, and calls generic matchmaking. An owned reservation is released synchronously so executor HTTP cannot remain in flight during the Roblox transition; the console reports the resulting decision-to-teleport-call latency. Initial cleanup is deferred, and invalid arrivals do not issue an unnecessary release request. Teleport initialization failures use one persistent controller with capped short backoff; it never gives up after a fixed retry count. A small randomized delay applies only after three consecutive invalid arrivals, reducing repeated matchmaking collisions without slowing normal hops.
 
 The killer remains different by design: it must claim and explicitly join the exact `JobId` containing the detected Vicious Bee.
 
