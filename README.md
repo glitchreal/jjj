@@ -11,20 +11,126 @@ Vic Hop / Vichop coordinates Bee Swarm Simulator searcher accounts and one kille
 Put this loader directly in every searcher executor's autoexecute folder:
 
 ```lua
-if not game:IsLoaded() then game.Loaded:Wait() end
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
 if game.PlaceId == 1537690962 then
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
+    local url = "https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua"
+    local cacheFile = "vichop_searcher_source.lua"
+    local retryDelay = 2
+
+    while true do
+        local started = false
+        local downloaded, source = pcall(function()
+            return game:HttpGet(url .. "?t=" .. os.time())
+        end)
+        if downloaded and type(source) == "string" then
+            local compiled, chunk = pcall(loadstring, source)
+            if compiled and type(chunk) == "function" then
+                if type(writefile) == "function" then
+                    pcall(writefile, cacheFile, source)
+                end
+                local ran, runError = pcall(chunk)
+                if ran then
+                    started = true
+                else
+                    warn("[Vichop/Loader] Searcher stopped:", tostring(runError))
+                end
+            else
+                warn("[Vichop/Loader] Searcher source could not compile")
+            end
+        else
+            warn("[Vichop/Loader] Searcher download failed:", tostring(source))
+        end
+
+        if not started and type(isfile) == "function" and type(readfile) == "function"
+            and isfile(cacheFile) then
+            local cachedOk, cachedSource = pcall(readfile, cacheFile)
+            if cachedOk and type(cachedSource) == "string" then
+                local compiled, chunk = pcall(loadstring, cachedSource)
+                if compiled and type(chunk) == "function" then
+                    local ran, runError = pcall(chunk)
+                    if ran then
+                        started = true
+                    else
+                        warn("[Vichop/Loader] Cached searcher stopped:", tostring(runError))
+                    end
+                end
+            end
+        end
+
+        if started then
+            break
+        end
+        task.wait(retryDelay)
+        retryDelay = math.min(retryDelay * 2, 30)
+    end
 end
 ```
 
 Put this loader directly in the killer executor's autoexecute folder:
 
 ```lua
-if not game:IsLoaded() then game.Loaded:Wait() end
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
 if game.PlaceId == 1537690962 then
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
+    local url = "https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua"
+    local cacheFile = "vichop_killer_source.lua"
+    local retryDelay = 2
+
+    while true do
+        local started = false
+        local downloaded, source = pcall(function()
+            return game:HttpGet(url .. "?t=" .. os.time())
+        end)
+        if downloaded and type(source) == "string" then
+            local compiled, chunk = pcall(loadstring, source)
+            if compiled and type(chunk) == "function" then
+                if type(writefile) == "function" then
+                    pcall(writefile, cacheFile, source)
+                end
+                local ran, runError = pcall(chunk)
+                if ran then
+                    started = true
+                else
+                    warn("[Vichop/Loader] Killer stopped:", tostring(runError))
+                end
+            else
+                warn("[Vichop/Loader] Killer source could not compile")
+            end
+        else
+            warn("[Vichop/Loader] Killer download failed:", tostring(source))
+        end
+
+        if not started and type(isfile) == "function" and type(readfile) == "function"
+            and isfile(cacheFile) then
+            local cachedOk, cachedSource = pcall(readfile, cacheFile)
+            if cachedOk and type(cachedSource) == "string" then
+                local compiled, chunk = pcall(loadstring, cachedSource)
+                if compiled and type(chunk) == "function" then
+                    local ran, runError = pcall(chunk)
+                    if ran then
+                        started = true
+                    else
+                        warn("[Vichop/Loader] Cached killer stopped:", tostring(runError))
+                    end
+                end
+            end
+        end
+
+        if started then
+            break
+        end
+        task.wait(retryDelay)
+        retryDelay = math.min(retryDelay * 2, 30)
+    end
 end
 ```
+
+Both loaders retry after 2, 4, 8, 16, and then at most 30 seconds instead of leaving the client idle after one failed GitHub request. After a successful download, they save a role-specific last-known-good source file. When executor file APIs are available, a later timeout can start from that cache immediately while preserving the same single autoexecute file per role. Existing executor autoexecute files must be replaced with these snippets; changing only the remotely downloaded support script cannot recover a failed initial download.
 
 There is no second shared loader or role file. The support scripts themselves wait for the local character, Humanoid, and HumanoidRootPart, then allow a two-second settle window before starting Vichop. They do not use `queue_on_teleport`. Searcher and killer scripts save a small non-secret, per-account resume file before teleporting because some executors do not preserve Roblox `TeleportData`. A per-server runtime guard prevents accidental duplicate starts.
 
@@ -34,20 +140,14 @@ Configure the Discord webhook before the killer loadstring in its autoexecute fi
 
 ```lua
 getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
-if not game:IsLoaded() then game.Loaded:Wait() end
-if game.PlaceId == 1537690962 then
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
-end
+-- Use the full retrying killer loader above after setting the webhook.
 ```
 
 A searcher ID defaults to `searcher-<Roblox user id>`, which is stable across teleports and unique per account. It can be overridden before loading:
 
 ```lua
 getgenv().VICHOP_SEARCHER_ID = "searcher-west-01"
-if not game:IsLoaded() then game.Loaded:Wait() end
-if game.PlaceId == 1537690962 then
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
-end
+-- Use the full retrying searcher loader above after setting the ID.
 ```
 
 Use a distinct value for every simultaneously running searcher.
