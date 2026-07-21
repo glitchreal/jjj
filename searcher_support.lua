@@ -6,7 +6,6 @@ local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
 
 local DATABASE_URL = "https://bss-job-queue-7bf75-default-rtdb.firebaseio.com"
-local LOADER_URL = "https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua"
 local INITIAL_SCAN_SECONDS = 5
 local SCAN_INTERVAL_SECONDS = 0.25
 local HEARTBEAT_SECONDS = 5
@@ -18,6 +17,8 @@ local CLEANUP_INTERVAL_SECONDS = 30
 local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_BACKOFF_MAX_SECONDS = 3
 local COLLISION_JITTER_AFTER = 3
+local CHARACTER_READY_TIMEOUT_SECONDS = 30
+local CHARACTER_SETTLE_SECONDS = 2
 
 local playerDeadline = os.clock() + 30
 while not Players.LocalPlayer and os.clock() < playerDeadline do
@@ -31,6 +32,23 @@ end
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
+local characterDeadline = os.clock() + CHARACTER_READY_TIMEOUT_SECONDS
+local character = PLAYER.Character
+while not character and os.clock() < characterDeadline do
+    task.wait(0.1)
+    character = PLAYER.Character
+end
+while character and os.clock() < characterDeadline
+    and (not character:FindFirstChildOfClass("Humanoid") or not character:FindFirstChild("HumanoidRootPart")) do
+    task.wait(0.1)
+end
+if not character or not character:FindFirstChildOfClass("Humanoid")
+    or not character:FindFirstChild("HumanoidRootPart") then
+    warn("[Vichop/Searcher] Character did not become ready")
+    return
+end
+task.wait(CHARACTER_SETTLE_SECONDS)
+local RESUME_FILE = "vichop_searcher_resume_" .. tostring(PLAYER.UserId) .. ".json"
 
 local env = type(getgenv) == "function" and getgenv() or _G
 local previousRuntime = env.__VICHOP_SEARCHER_RUNTIME
@@ -56,16 +74,11 @@ local runtime = {
 }
 env.__VICHOP_SEARCHER_RUNTIME = runtime
 
-local pendingSearcherContext = env.__VICHOP_SEARCHER_PENDING
 local configuredSearcherId = env.VICHOP_SEARCHER_ID
-    or (type(pendingSearcherContext) == "table" and pendingSearcherContext.vichopSearcherId)
 local SEARCHER_ID = type(configuredSearcherId) == "string" and configuredSearcherId ~= ""
     and configuredSearcherId
     or ("searcher-" .. tostring(PLAYER.UserId))
 env.VICHOP_SEARCHER_ID = SEARCHER_ID
-runtime.rehopCount = type(pendingSearcherContext) == "table"
-    and math.max(0, tonumber(pendingSearcherContext.rehopCount) or 0) or 0
-
 local httpRequest = request or http_request or (syn and syn.request)
 if type(httpRequest) ~= "function" then
     warn("[Vichop/Searcher] Disabled: executor HTTP requests are unavailable")
@@ -73,7 +86,6 @@ if type(httpRequest) ~= "function" then
     return
 end
 
-local queueOnTeleport = queue_on_teleport or (syn and syn.queue_on_teleport)
 local currentJobEventId = nil
 local lastJobHeartbeat = 0
 local lastCleanup = 0
@@ -81,6 +93,46 @@ local serverStartedAtClock = os.clock()
 
 local function now()
     return os.time()
+end
+
+local function readResumeContext()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" or not isfile(RESUME_FILE) then
+        return nil
+    end
+    local readOk, raw = pcall(readfile, RESUME_FILE)
+    if not readOk or type(raw) ~= "string" then
+        return nil
+    end
+    local decodeOk, saved = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not decodeOk or type(saved) ~= "table" or saved.vichopRole ~= "searcher"
+        or now() - tonumber(saved.savedAt or 0) > 120 then
+        return nil
+    end
+    return saved
+end
+
+local function writeResumeContext(previousJobId)
+    if type(writefile) ~= "function" then
+        warn("[Vichop/Searcher] Local resume file is unavailable; relying on TeleportData")
+        return false
+    end
+    local encodeOk, encoded = pcall(HttpService.JSONEncode, HttpService, {
+        vichopRole = "searcher",
+        vichopSearcherId = SEARCHER_ID,
+        vichopPreviousJobId = previousJobId,
+        vichopFromJobId = previousJobId,
+        vichopRehopCount = runtime.rehopCount,
+        savedAt = now(),
+    })
+    if not encodeOk then
+        warn("[Vichop/Searcher] Could not encode local resume context")
+        return false
+    end
+    local writeOk, writeError = pcall(writefile, RESUME_FILE, encoded)
+    if not writeOk then
+        warn("[Vichop/Searcher] Could not save local resume context:", tostring(writeError))
+    end
+    return writeOk
 end
 
 local function runtimeIsCurrent()
@@ -408,26 +460,6 @@ local function reportMissing()
     end, 3)
 end
 
-local function queueLoader(previousJobId)
-    if type(queueOnTeleport) ~= "function" then
-        return
-    end
-    local loader = string.format(
-        'local e=(getgenv and getgenv() or _G);e.VICHOP_SEARCHER_ID=%q;e.__VICHOP_SEARCHER_PENDING={vichopRole="searcher",vichopSearcherId=%q,vichopPreviousJobId=%q,vichopFromJobId=%q,rehopCount=%d,queuedAt=%d};loadstring(game:HttpGet("%s?t=" .. os.time()))()',
-        SEARCHER_ID,
-        SEARCHER_ID,
-        tostring(previousJobId),
-        tostring(previousJobId),
-        runtime.rehopCount,
-        now(),
-        LOADER_URL
-    )
-    local ok, err = pcall(queueOnTeleport, loader)
-    if not ok then
-        warn("[Vichop/Searcher] Could not queue loader for teleport:", tostring(err))
-    end
-end
-
 local function matchmakingTeleportData(previousJobId)
     return {
         vichopRole = "searcher",
@@ -442,7 +474,7 @@ end
 local function genericTeleportOnce(reason, requestedAt, attempt)
     runtime.teleportError = nil
     runtime.teleportStarted = false
-    queueLoader(game.JobId)
+    writeResumeContext(game.JobId)
 
     local ok, err = pcall(function()
         local callLatency = os.clock() - requestedAt
@@ -640,13 +672,7 @@ local function getJoinTeleportData()
         and joinData.TeleportData.vichopRole == "searcher" then
         return joinData.TeleportData
     end
-    local pending = env.__VICHOP_SEARCHER_PENDING
-    env.__VICHOP_SEARCHER_PENDING = nil
-    if type(pending) == "table" and pending.vichopRole == "searcher"
-        and now() - tonumber(pending.queuedAt or 0) <= 60 then
-        return pending
-    end
-    return {}
+    return readResumeContext() or {}
 end
 
 local teleportDataOnJoin = getJoinTeleportData()

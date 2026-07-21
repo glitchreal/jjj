@@ -8,29 +8,31 @@ Vic Hop / Vichop coordinates Bee Swarm Simulator searcher accounts and one kille
 
 ## Loaders
 
-Run this on every searcher account, normally from the executor's autoexecute folder:
-
-```lua
-if not game:IsLoaded() then game.Loaded:Wait() end 
-loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
-```
-
-Run this on the killer account:
-
-```lua
-if not game:IsLoaded() then game.Loaded:Wait() end 
-loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
-```
-
-The scripts also use `queue_on_teleport` when it exists. The queued loader carries non-secret session and expected-server metadata as a fallback for executors that do not preserve `TeleportData` or `getgenv()` across a client transition. A per-server runtime guard prevents the queued loader and executor autoexecute from starting duplicate loops.
-
-## Optional configuration
-
-Configure the Discord webhook in the killer loader. The URL is never written to Firebase, the stats file, logs, or embeds.
+Put this loader directly in every searcher executor's autoexecute folder:
 
 ```lua
 if not game:IsLoaded() then game.Loaded:Wait() end
-getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE" 
+loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
+```
+
+Put this loader directly in the killer executor's autoexecute folder:
+
+```lua
+if not game:IsLoaded() then game.Loaded:Wait() end
+loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
+```
+
+There is no second shared loader or role file. The support scripts themselves wait for the local character, Humanoid, and HumanoidRootPart, then allow a two-second settle window before starting Vichop. They do not use `queue_on_teleport`. Searcher and killer scripts save a small non-secret, per-account resume file before teleporting because some executors do not preserve Roblox `TeleportData`. A per-server runtime guard prevents accidental duplicate starts.
+
+For the currently tested searcher account, the Opiumware loader is `/Users/andy/Opiumware/autoexec/vichop-searcher.lua`.
+
+## Optional configuration
+
+Configure the Discord webhook before the killer loadstring in its autoexecute file. The URL is never written to Firebase, the stats file, logs, or embeds.
+
+```lua
+getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
+if not game:IsLoaded() then game.Loaded:Wait() end
 loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
 ```
 
@@ -38,6 +40,8 @@ A searcher ID defaults to `searcher-<Roblox user id>`, which is stable across te
 
 ```lua
 getgenv().VICHOP_SEARCHER_ID = "searcher-west-01"
+if not game:IsLoaded() then game.Loaded:Wait() end
+loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
 ```
 
 Use a distinct value for every simultaneously running searcher.
@@ -73,9 +77,9 @@ TeleportService:Teleport(game.PlaceId, Players.LocalPlayer, teleportData)
 
 No destination `ServerInstanceId` is supplied, so Roblox public matchmaking selects the server. Searchers do not call the Roblox public-server REST endpoint and do not use candidate pools, page cursors, proxies, cookies, or rate-limit workarounds. A `429` from server-list discovery therefore cannot block normal searcher hopping.
 
-The queued loader and `teleportData` carry the previous `JobId`, stable searcher ID, and repeated-rehop count. After arrival, the script rejects the server immediately when matchmaking returned the previous `JobId`, the account or fleet checked it recently, Firebase history is unavailable, or another active searcher wins its ETag reservation. Only a valid reservation starts the normal five-second Vicious scan and heartbeat.
+The local resume file and `teleportData` carry the previous `JobId`, stable searcher ID, and repeated-rehop count. After arrival, the script rejects the server immediately when matchmaking returned the previous `JobId`, the account or fleet checked it recently, Firebase history is unavailable, or another active searcher wins its ETag reservation. Only a valid reservation starts the normal five-second Vicious scan and heartbeat.
 
-The no-Vicious critical path queues the resume context and calls generic matchmaking immediately. The console reports precise decision-to-teleport-call latency. Teleport initialization failures use one persistent controller with capped short backoff; it never gives up after a fixed retry count. A small randomized delay applies only after three consecutive invalid arrivals, reducing repeated matchmaking collisions without slowing normal hops.
+The no-Vicious critical path saves the resume context locally and calls generic matchmaking immediately. The console reports precise decision-to-teleport-call latency. Teleport initialization failures use one persistent controller with capped short backoff; it never gives up after a fixed retry count. A small randomized delay applies only after three consecutive invalid arrivals, reducing repeated matchmaking collisions without slowing normal hops.
 
 The killer remains different by design: it must claim and explicitly join the exact `JobId` containing the detected Vicious Bee.
 
@@ -113,16 +117,16 @@ If either side cannot be read, the job, tracker result, and Discord embed use `U
 
 When `Drawing` is supported, the killer tracker shows session and lifetime kills and stingers, joined servers, current state, shortened current server, last result, and session uptime. Console notifications remain available without `Drawing`.
 
-Lifetime and active-session values are stored in `vichop_stats.json`. The session ID is passed in teleport data and in the queued-loader fallback, so session counters do not reset on every hop. Writes use a temporary file before replacing the main file. Invalid JSON is copied to a timestamped `.corrupt-*.json` backup when file APIs are available, then clean defaults are used.
+Lifetime and active-session values are stored in `vichop_stats.json`. The session ID is passed in teleport data and in the per-account local resume file, so session counters do not reset on every hop. Writes use a temporary file before replacing the main file. Invalid JSON is copied to a timestamped `.corrupt-*.json` backup when file APIs are available, then clean defaults are used.
 
 The Discord outcome uses inline Reward, Session, Lifetime, and Server fields. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
 
 ## Executor compatibility
 
 - An executor HTTP request function (`request`, `http_request`, or `syn.request`) is required for Firebase coordination. Searcher matchmaking itself does not use HTTP discovery.
-- `queue_on_teleport` is optional when executor autoexecute is configured.
+- Executor autoexecute is required for continuous hopping; `queue_on_teleport` is not used.
 - `Drawing` is optional; its absence disables only the visual tracker.
-- Local file APIs are optional; their absence disables persistent lifetime statistics.
+- Local file APIs preserve resume context when the executor drops `TeleportData`; without both mechanisms, same-server comparison and killer claim resume are unavailable. Their absence also disables persistent lifetime statistics.
 - The webhook is optional and disabled when `VICHOP_WEBHOOK_URL` is empty.
 - Firebase atomic coordination requires response headers, including `ETag`, to be exposed by the executor request API.
 
