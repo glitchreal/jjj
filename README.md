@@ -2,9 +2,9 @@
 
 Vic Hop / Vichop coordinates Bee Swarm Simulator searcher accounts and one killer through Firebase Realtime Database.
 
-- `searcher_support.lua` reserves public servers, watches `Workspace.Monsters`, and publishes a queue job only after it sees a live Vicious Bee with a living Humanoid.
+- `searcher_support.lua` uses normal Roblox public matchmaking, validates and reserves the arrived server, watches `Workspace.Monsters`, and publishes a queue job only after it sees a live Vicious Bee with a living Humanoid.
 - `killer_support.lua` atomically claims fresh jobs, joins the exact `JobId`, confirms a live Vicious Bee and its death, settles the stinger reward, and updates the local tracker.
-- Searchers select explicit public `JobId` values. Active reservations, per-searcher history, and fleet history reduce collisions and short server cycles.
+- Searchers never request or select destination `JobId` values. Active reservations, per-searcher history, and fleet history resolve matchmaking collisions after arrival and reduce short server cycles.
 
 ## Loaders
 
@@ -63,6 +63,22 @@ An active reservation contains `searcherId`, `claimedAt`, `heartbeatAt`, and `pl
 
 Reservations and killer claims use Firebase REST ETags with `if-match`. This compare-and-swap operation prevents two clients from winning the same reservation or queue claim after reading the same old value. If an executor does not expose Firebase's `ETag` response header, the script refuses the unsafe claim instead of falling back to read-then-write.
 
+## Searcher matchmaking
+
+The default and only searcher hop path calls:
+
+```lua
+TeleportService:Teleport(game.PlaceId, Players.LocalPlayer, teleportData)
+```
+
+No destination `ServerInstanceId` is supplied, so Roblox public matchmaking selects the server. Searchers do not call the Roblox public-server REST endpoint and do not use candidate pools, page cursors, proxies, cookies, or rate-limit workarounds. A `429` from server-list discovery therefore cannot block normal searcher hopping.
+
+The queued loader and `teleportData` carry the previous `JobId`, stable searcher ID, and repeated-rehop count. After arrival, the script rejects the server immediately when matchmaking returned the previous `JobId`, the account or fleet checked it recently, Firebase history is unavailable, or another active searcher wins its ETag reservation. Only a valid reservation starts the normal five-second Vicious scan and heartbeat.
+
+The no-Vicious critical path queues the resume context and calls generic matchmaking immediately. The console reports precise decision-to-teleport-call latency. Teleport initialization failures use one persistent controller with capped short backoff; it never gives up after a fixed retry count. A small randomized delay applies only after three consecutive invalid arrivals, reducing repeated matchmaking collisions without slowing normal hops.
+
+The killer remains different by design: it must claim and explicitly join the exact `JobId` containing the detected Vicious Bee.
+
 Job states:
 
 - `spawned`: a searcher currently sees a live Vicious Bee.
@@ -103,7 +119,7 @@ The Discord outcome uses inline Reward, Session, Lifetime, and Server fields. We
 
 ## Executor compatibility
 
-- An executor HTTP request function (`request`, `http_request`, or `syn.request`) is required for Firebase and server discovery.
+- An executor HTTP request function (`request`, `http_request`, or `syn.request`) is required for Firebase coordination. Searcher matchmaking itself does not use HTTP discovery.
 - `queue_on_teleport` is optional when executor autoexecute is configured.
 - `Drawing` is optional; its absence disables only the visual tracker.
 - Local file APIs are optional; their absence disables persistent lifetime statistics.
