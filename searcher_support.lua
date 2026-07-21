@@ -152,12 +152,15 @@ local function writeResumeContext(previousJobId, expectedJobId, prepared, reques
         fromJobId = previousJobId,
         expectedJobId = expectedJobId,
         candidateSource = prepared and prepared.source or nil,
+        reservationResult = prepared and prepared.reservationResult or nil,
         preparedAt = prepared and prepared.reservedAt or nil,
         preparedBeforeDecision = prepared and requestedAt
             and prepared.reservedAtClock <= requestedAt or false,
         decisionToCallLatency = requestedAt and (os.clock() - requestedAt) or nil,
         serverListRequests = runtime.serverListRequests,
         saw429 = runtime.saw429,
+        backgroundRequestsAtCall = runtime.backgroundRequests,
+        httpRequestsAtCall = runtime.httpRequests,
         teleportedAt = now(),
         savedAt = now(),
     })
@@ -1118,8 +1121,11 @@ if teleportDataOnJoin.vichopRole == "searcher" then
         preparedBeforeDecision = teleportDataOnJoin.preparedBeforeDecision == true,
         callLatency = tonumber(teleportDataOnJoin.decisionToCallLatency),
         candidateSource = teleportDataOnJoin.candidateSource,
+        reservationResult = teleportDataOnJoin.reservationResult,
         serverListRequests = tonumber(teleportDataOnJoin.serverListRequests or 0) or 0,
         saw429 = teleportDataOnJoin.saw429 == true,
+        backgroundRequestsAtCall = tonumber(teleportDataOnJoin.backgroundRequestsAtCall or 0) or 0,
+        httpRequestsAtCall = tonumber(teleportDataOnJoin.httpRequestsAtCall or 0) or 0,
     }
     print(string.format(
         "[Vichop/Searcher] Arrival from=%s expected=%s actual=%s latency=%s source=%s",
