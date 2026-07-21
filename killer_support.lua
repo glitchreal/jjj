@@ -7,7 +7,6 @@ local TeleportService = game:GetService("TeleportService")
 local StarterGui = game:GetService("StarterGui")
 
 local DATABASE_URL = "https://bss-job-queue-7bf75-default-rtdb.firebaseio.com"
-local LOADER_URL = "https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua"
 local STATS_FILE = "vichop_stats.json"
 local QUEUE_POLL_SECONDS = 0.75
 local ARRIVAL_WAIT_SECONDS = 15
@@ -23,6 +22,8 @@ local CLEANUP_INTERVAL_SECONDS = 30
 local TERMINAL_RETENTION_SECONDS = 60 * 60
 local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_RETRIES = 3
+local CHARACTER_READY_TIMEOUT_SECONDS = 30
+local CHARACTER_SETTLE_SECONDS = 2
 
 local playerDeadline = os.clock() + 30
 while not Players.LocalPlayer and os.clock() < playerDeadline do
@@ -36,6 +37,23 @@ end
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
+local characterDeadline = os.clock() + CHARACTER_READY_TIMEOUT_SECONDS
+local character = PLAYER.Character
+while not character and os.clock() < characterDeadline do
+    task.wait(0.1)
+    character = PLAYER.Character
+end
+while character and os.clock() < characterDeadline
+    and (not character:FindFirstChildOfClass("Humanoid") or not character:FindFirstChild("HumanoidRootPart")) do
+    task.wait(0.1)
+end
+if not character or not character:FindFirstChildOfClass("Humanoid")
+    or not character:FindFirstChild("HumanoidRootPart") then
+    warn("[Vichop/Killer] Character did not become ready")
+    return
+end
+task.wait(CHARACTER_SETTLE_SECONDS)
+local RESUME_FILE = "vichop_killer_resume_" .. tostring(PLAYER.UserId) .. ".json"
 
 local env = type(getgenv) == "function" and getgenv() or _G
 local function getJoinTeleportData()
@@ -44,11 +62,13 @@ local function getJoinTeleportData()
         and joinData.TeleportData.vichopRole == "killer" then
         return joinData.TeleportData
     end
-    local pending = env.__VICHOP_KILLER_PENDING
-    env.__VICHOP_KILLER_PENDING = nil
-    if type(pending) == "table" and pending.vichopRole == "killer"
-        and os.time() - tonumber(pending.queuedAt or 0) <= 60 then
-        return pending
+    if type(isfile) == "function" and type(readfile) == "function" and isfile(RESUME_FILE) then
+        local readOk, raw = pcall(readfile, RESUME_FILE)
+        local decodeOk, saved = pcall(HttpService.JSONDecode, HttpService, readOk and raw or "")
+        if decodeOk and type(saved) == "table" and saved.vichopRole == "killer"
+            and os.time() - tonumber(saved.savedAt or 0) <= 120 then
+            return saved
+        end
     end
     return {}
 end
@@ -95,8 +115,6 @@ if type(httpRequest) ~= "function" then
     runtime.active = false
     return
 end
-local queueOnTeleport = queue_on_teleport or (syn and syn.queue_on_teleport)
-
 local function now()
     return os.time()
 end
@@ -929,24 +947,28 @@ local function brieflyDrainWebhook()
     end
 end
 
-local function queueLoader(key, job)
-    if type(queueOnTeleport) ~= "function" then
-        return
+local function writeResumeContext(key, job)
+    if type(writefile) ~= "function" then
+        warn("[Vichop/Killer] Local resume file is unavailable; relying on TeleportData")
+        return false
     end
-    local loader = string.format(
-        'local e=(getgenv and getgenv() or _G);e.__VICHOP_KILLER_SESSION_ID=%q;e.__VICHOP_KILLER_PENDING={vichopRole="killer",vichopSessionId=%q,vichopExpectedJobId=%q,vichopClaimKey=%q,vichopFromJobId=%q,queuedAt=%d};loadstring(game:HttpGet("%s?t=" .. os.time()))()',
-        sessionId,
-        sessionId,
-        tostring(job.jobId or key),
-        tostring(key),
-        game.JobId,
-        now(),
-        LOADER_URL
-    )
-    local ok, err = pcall(queueOnTeleport, loader)
-    if not ok then
-        warn("[Vichop/Killer] Could not queue loader for teleport:", tostring(err))
+    local encodeOk, encoded = pcall(HttpService.JSONEncode, HttpService, {
+        vichopRole = "killer",
+        vichopSessionId = sessionId,
+        vichopExpectedJobId = tostring(job.jobId or key),
+        vichopClaimKey = tostring(key),
+        vichopFromJobId = game.JobId,
+        savedAt = now(),
+    })
+    if not encodeOk then
+        warn("[Vichop/Killer] Could not encode local resume context")
+        return false
     end
+    local writeOk, writeError = pcall(writefile, RESUME_FILE, encoded)
+    if not writeOk then
+        warn("[Vichop/Killer] Could not save local resume context:", tostring(writeError))
+    end
+    return writeOk
 end
 
 local function teleportToClaim(key, job)
@@ -956,7 +978,7 @@ local function teleportToClaim(key, job)
         end
         runtime.teleportStarted = false
         runtime.teleportError = nil
-        queueLoader(key, job)
+        writeResumeContext(key, job)
         brieflyDrainWebhook()
         setState("TELEPORTING", "Attempt " .. tostring(attempt) .. " to " .. shortJobId(key))
 
