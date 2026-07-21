@@ -28,6 +28,7 @@ local CANDIDATE_RESERVATION_ATTEMPTS = 12
 local REFILL_LEASE_SECONDS = 15
 local REFILL_PAGES_PER_LEASE = 2
 local REFILL_RETRY_SECONDS = 2
+local PREPARATION_STALE_SECONDS = 45
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
 
@@ -89,6 +90,8 @@ local runtime = {
     arrivalStatus = "pending",
     nextHop = nil,
     preparing = false,
+    preparationGeneration = 0,
+    preparationStartedAt = 0,
     refillRunning = false,
     backgroundRequests = 0,
     httpRequests = 0,
@@ -622,7 +625,7 @@ local function refillCandidatePool()
     return refillOk, refillReason
 end
 
-local function prepareFromCandidatePool()
+local function prepareFromCandidatePool(preparationGeneration)
     local pool, poolOk = firebaseGet("/candidatePool.json")
     local ownRecent, ownRecentOk = firebaseGet("/recentServers/" .. SEARCHER_ID .. ".json")
     local fleetRecent, fleetRecentOk = firebaseGet("/fleetRecent.json")
@@ -665,9 +668,10 @@ local function prepareFromCandidatePool()
         local selected = candidates[index]
         local reserved, reserveReason = reserveServer(selected.jobId)
         if reserved then
-            if runtime.stopBackground or runtime.holdPosition or not runtimeIsCurrent() then
+            if runtime.stopBackground or runtime.holdPosition or not runtimeIsCurrent()
+                or runtime.preparationGeneration ~= preparationGeneration then
                 releaseReservation(selected.jobId)
-                return false, "preparation_cancelled"
+                return false, "preparation_superseded"
             end
             runtime.nextHop = {
                 jobId = selected.jobId,
@@ -686,16 +690,22 @@ local function prepareFromCandidatePool()
 end
 
 local function ensureNextHop()
-    if runtime.nextHop or runtime.preparing or runtime.stopBackground or runtime.holdPosition
+    if runtime.nextHop or runtime.stopBackground or runtime.holdPosition
         or not runtimeIsCurrent() then
         return
     end
+    if runtime.preparing then
+        return
+    end
+    runtime.preparationGeneration = runtime.preparationGeneration + 1
+    local preparationGeneration = runtime.preparationGeneration
     runtime.preparing = true
+    runtime.preparationStartedAt = os.clock()
     task.spawn(function()
         local backgroundOk = runBackground("destination preparation", function()
             while runtimeIsCurrent() and not runtime.stopBackground and not runtime.holdPosition
-                and not runtime.nextHop do
-                local prepared = prepareFromCandidatePool()
+                and not runtime.nextHop and runtime.preparationGeneration == preparationGeneration do
+                local prepared = prepareFromCandidatePool(preparationGeneration)
                 if prepared then
                     break
                 end
@@ -705,9 +715,13 @@ local function ensureNextHop()
                 end
             end
         end)
-        runtime.preparing = false
-        runtime.refillRunning = false
-        if not backgroundOk and runtimeIsCurrent() and not runtime.stopBackground then
+        if runtime.preparationGeneration == preparationGeneration then
+            runtime.preparing = false
+            runtime.preparationStartedAt = 0
+            runtime.refillRunning = false
+        end
+        if not backgroundOk and runtimeIsCurrent() and not runtime.stopBackground
+            and runtime.preparationGeneration == preparationGeneration then
             task.wait(REFILL_RETRY_SECONDS)
             ensureNextHop()
         end
@@ -1159,6 +1173,21 @@ local playerTeleportConnection = PLAYER.OnTeleport:Connect(function(state)
 end)
 
 local function runSearcher()
+    task.spawn(function()
+        while runtimeIsCurrent() do
+            task.wait(5)
+            if runtimeIsCurrent() and runtime.preparing and runtime.preparationStartedAt > 0
+                and os.clock() - runtime.preparationStartedAt >= PREPARATION_STALE_SECONDS then
+                warn("[Vichop/Searcher] Destination preparation stalled; restarting preparation")
+                runtime.preparationGeneration = runtime.preparationGeneration + 1
+                runtime.preparing = false
+                runtime.preparationStartedAt = 0
+                runtime.refillRunning = false
+                ensureNextHop()
+            end
+        end
+    end)
+
     local arrivedValid, arrivalReason = validateArrivedServer(teleportDataOnJoin)
     runtime.arrivalStatus = arrivalReason
     if not arrivedValid then
