@@ -12,14 +12,18 @@ Put this loader directly in every searcher executor's autoexecute folder:
 
 ```lua
 if not game:IsLoaded() then game.Loaded:Wait() end
-loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
+if game.PlaceId == 1537690962 then
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
+end
 ```
 
 Put this loader directly in the killer executor's autoexecute folder:
 
 ```lua
 if not game:IsLoaded() then game.Loaded:Wait() end
-loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
+if game.PlaceId == 1537690962 then
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
+end
 ```
 
 There is no second shared loader or role file. The support scripts themselves wait for the local character, Humanoid, and HumanoidRootPart, then allow a two-second settle window before starting Vichop. They do not use `queue_on_teleport`. Searcher and killer scripts save a small non-secret, per-account resume file before teleporting because some executors do not preserve Roblox `TeleportData`. A per-server runtime guard prevents accidental duplicate starts.
@@ -33,7 +37,9 @@ Configure the Discord webhook before the killer loadstring in its autoexecute fi
 ```lua
 getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
 if not game:IsLoaded() then game.Loaded:Wait() end
-loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
+if game.PlaceId == 1537690962 then
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua?t=" .. os.time()))()
+end
 ```
 
 A searcher ID defaults to `searcher-<Roblox user id>`, which is stable across teleports and unique per account. It can be overridden before loading:
@@ -41,7 +47,9 @@ A searcher ID defaults to `searcher-<Roblox user id>`, which is stable across te
 ```lua
 getgenv().VICHOP_SEARCHER_ID = "searcher-west-01"
 if not game:IsLoaded() then game.Loaded:Wait() end
-loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
+if game.PlaceId == 1537690962 then
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/jjj/main/searcher_support.lua?t=" .. os.time()))()
+end
 ```
 
 Use a distinct value for every simultaneously running searcher.
