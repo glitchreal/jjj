@@ -6,7 +6,27 @@
       ".read": true,
       ".indexOn": ["status", "createdAt", "updatedAt"],
       "$job": {
-        ".write": "newData.hasChildren(['placeId', 'jobId', 'status', 'createdAt', 'updatedAt']) && newData.child('placeId').isNumber() && newData.child('jobId').isString() && newData.child('status').isString() && (newData.child('status').val() == 'spawned' || newData.child('status').val() == 'claimed' || newData.child('status').val() == 'killed' || newData.child('status').val() == 'expired') && newData.child('createdAt').isNumber() && newData.child('updatedAt').isNumber()"
+        ".write": "!newData.exists() || (newData.hasChildren(['placeId', 'jobId', 'status', 'createdAt', 'updatedAt']) && newData.child('placeId').isNumber() && newData.child('jobId').isString() && newData.child('status').isString() && (newData.child('status').val() == 'spawned' || newData.child('status').val() == 'claimed' || newData.child('status').val() == 'resolving' || newData.child('status').val() == 'killed' || newData.child('status').val() == 'failed' || newData.child('status').val() == 'expired' || newData.child('status').val() == 'missing') && newData.child('createdAt').isNumber() && newData.child('updatedAt').isNumber())"
+      }
+    },
+    "activeServers": {
+      ".read": true,
+      "$job": {
+        ".write": "!newData.exists() || (newData.hasChildren(['searcherId', 'claimedAt', 'heartbeatAt', 'placeId']) && newData.child('searcherId').isString() && newData.child('claimedAt').isNumber() && newData.child('heartbeatAt').isNumber() && newData.child('placeId').isNumber())"
+      }
+    },
+    "recentServers": {
+      ".read": true,
+      "$searcher": {
+        "$job": {
+          ".write": "!newData.exists() || newData.isNumber()"
+        }
+      }
+    },
+    "fleetRecent": {
+      ".read": true,
+      "$job": {
+        ".write": "!newData.exists() || (newData.hasChildren(['searcherId', 'checkedAt', 'placeId']) && newData.child('searcherId').isString() && newData.child('checkedAt').isNumber() && newData.child('placeId').isNumber())"
       }
     },
     "scripts": {
