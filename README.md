@@ -80,12 +80,12 @@ Reservations and killer claims use Firebase REST ETags with `if-match`. This com
 The default and only searcher hop path calls:
 
 ```lua
-TeleportService:Teleport(game.PlaceId, Players.LocalPlayer, teleportData)
+TeleportService:Teleport(game.PlaceId)
 ```
 
-No destination `ServerInstanceId` is supplied, so Roblox public matchmaking selects the server. Searchers do not call the Roblox public-server REST endpoint and do not use candidate pools, page cursors, proxies, cookies, or rate-limit workarounds. A `429` from server-list discovery therefore cannot block normal searcher hopping.
+No player, teleport payload, or destination `ServerInstanceId` is supplied, so Roblox public matchmaking selects the server through the simplest executor-compatible overload. Searchers do not call the Roblox public-server REST endpoint and do not use candidate pools, page cursors, proxies, cookies, or rate-limit workarounds. A `429` from server-list discovery therefore cannot block normal searcher hopping.
 
-The local resume file and `teleportData` carry the previous `JobId`, stable searcher ID, and repeated-rehop count. After arrival, the script rejects the server immediately when matchmaking returned the previous `JobId`, the account or fleet checked it recently, Firebase history is unavailable, or another active searcher wins its ETag reservation. Only a valid reservation starts the normal five-second Vicious scan and heartbeat.
+The local resume file carries the previous `JobId`, stable searcher ID, and repeated-rehop count. After arrival, the script rejects the server immediately when matchmaking returned the previous `JobId`, the account or fleet checked it recently, Firebase history is unavailable, or another active searcher wins its ETag reservation. Only a valid reservation starts the normal five-second Vicious scan and heartbeat.
 
 The no-Vicious critical path saves the resume context locally and calls generic matchmaking immediately. The console reports precise decision-to-teleport-call latency. Teleport initialization failures use one persistent controller with capped short backoff; it never gives up after a fixed retry count. A small randomized delay applies only after three consecutive invalid arrivals, reducing repeated matchmaking collisions without slowing normal hops.
 
@@ -134,7 +134,7 @@ The Discord outcome uses inline Reward, Session, Lifetime, and Server fields. We
 - An executor HTTP request function (`request`, `http_request`, or `syn.request`) is required for Firebase coordination. Searcher matchmaking itself does not use HTTP discovery.
 - Executor autoexecute is required for continuous hopping; `queue_on_teleport` is not used.
 - `Drawing` is optional; its absence disables only the visual tracker.
-- Local file APIs preserve resume context when the executor drops `TeleportData`; without both mechanisms, same-server comparison and killer claim resume are unavailable. Their absence also disables persistent lifetime statistics.
+- Local file APIs preserve searcher resume context and provide a fallback when killer `TeleportData` is dropped. Without them, same-server comparison and killer claim resume are unavailable. Their absence also disables persistent lifetime statistics.
 - The webhook is optional and disabled when `VICHOP_WEBHOOK_URL` is empty.
 - Firebase atomic coordination requires response headers, including `ETag`, to be exposed by the executor request API.
 

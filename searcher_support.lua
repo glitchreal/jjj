@@ -118,7 +118,7 @@ end
 
 local function writeResumeContext(previousJobId)
     if type(writefile) ~= "function" then
-        warn("[Vichop/Searcher] Local resume file is unavailable; relying on TeleportData")
+        warn("[Vichop/Searcher] Local resume file is unavailable; previous JobId cannot persist")
         return false
     end
     local encodeOk, encoded = pcall(HttpService.JSONEncode, HttpService, {
@@ -465,17 +465,6 @@ local function reportMissing()
     end, 3)
 end
 
-local function matchmakingTeleportData(previousJobId)
-    return {
-        vichopRole = "searcher",
-        vichopSearcherId = SEARCHER_ID,
-        vichopPreviousJobId = previousJobId,
-        vichopFromJobId = previousJobId,
-        vichopRehopCount = runtime.rehopCount,
-        vichopTeleportedAt = now(),
-    }
-end
-
 local function genericTeleportOnce(reason, requestedAt, attempt)
     runtime.teleportError = nil
     runtime.teleportStarted = false
@@ -489,7 +478,7 @@ local function genericTeleportOnce(reason, requestedAt, attempt)
             tostring(reason),
             attempt
         ))
-        TeleportService:Teleport(game.PlaceId, PLAYER, matchmakingTeleportData(game.JobId))
+        TeleportService:Teleport(game.PlaceId)
     end)
     if not ok then
         return false, tostring(err)
