@@ -197,6 +197,8 @@ The resume file carries the previous and expected JobIds, candidate source, prep
 
 At the no-Vicious decision, the controller freezes new background work and drains anything already in flight before saving the resume file and teleporting. It does not discover, sort, reserve, clean up, fetch GitHub, or release the old current reservation in that transition phase. The old reservation expires naturally. If no destination is prepared, one controller enters `WAITING_FOR_DESTINATION`, logs once, and teleports as soon as preparation finishes. It never falls back to generic matchmaking and never permanently gives up.
 
+Destination preparation uses a generation guard and a 45-second watchdog. If a Firebase or executor transport call leaves one preparation generation stalled, the searcher retires that generation and starts a new one automatically instead of requiring the support script to be executed again.
+
 The killer remains different by design: it must claim and explicitly join the exact `JobId` containing the detected Vicious Bee.
 
 Job states:
