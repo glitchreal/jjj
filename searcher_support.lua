@@ -16,9 +16,8 @@ local FLEET_RECENT_TTL_SECONDS = 45
 local JOB_STALE_SECONDS = 35
 local CLEANUP_INTERVAL_SECONDS = 30
 local TELEPORT_TIMEOUT_SECONDS = 7
-local TELEPORT_RETRIES = 3
-local MAX_SERVER_PAGES = 2
-local MAX_RESERVATION_ATTEMPTS = 8
+local TELEPORT_BACKOFF_MAX_SECONDS = 3
+local COLLISION_JITTER_AFTER = 3
 
 local playerDeadline = os.clock() + 30
 while not Players.LocalPlayer and os.clock() < playerDeadline do
@@ -43,12 +42,17 @@ end
 local runtime = {
     active = true,
     jobId = game.JobId,
+    generation = HttpService:GenerateGUID(false),
     hopping = false,
+    hopRequested = false,
+    teleportControllerRunning = false,
     teleportStarted = false,
     teleportError = nil,
     currentReservationOwned = false,
-    expectedTarget = nil,
     cleanupRunning = false,
+    rehopCount = 0,
+    previousJobId = "",
+    arrivalStatus = "pending",
 }
 env.__VICHOP_SEARCHER_RUNTIME = runtime
 
@@ -59,6 +63,8 @@ local SEARCHER_ID = type(configuredSearcherId) == "string" and configuredSearche
     and configuredSearcherId
     or ("searcher-" .. tostring(PLAYER.UserId))
 env.VICHOP_SEARCHER_ID = SEARCHER_ID
+runtime.rehopCount = type(pendingSearcherContext) == "table"
+    and math.max(0, tonumber(pendingSearcherContext.rehopCount) or 0) or 0
 
 local httpRequest = request or http_request or (syn and syn.request)
 if type(httpRequest) ~= "function" then
@@ -71,12 +77,14 @@ local queueOnTeleport = queue_on_teleport or (syn and syn.queue_on_teleport)
 local currentJobEventId = nil
 local lastJobHeartbeat = 0
 local lastCleanup = 0
-local serverStartedAt = os.time()
-local serverListBackoffUntil = 0
-local serverListFailures = 0
+local serverStartedAtClock = os.clock()
 
 local function now()
     return os.time()
+end
+
+local function runtimeIsCurrent()
+    return runtime.active and env.__VICHOP_SEARCHER_RUNTIME == runtime
 end
 
 local function shortJobId(jobId)
@@ -400,114 +408,17 @@ local function reportMissing()
     end, 3)
 end
 
-local function getPublicServers()
-    local results = {}
-    local cursor = nil
-    if os.clock() < serverListBackoffUntil then
-        return results
-    end
-    for _ = 1, MAX_SERVER_PAGES do
-        local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId)
-            .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
-        if cursor and cursor ~= "" then
-            url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
-        end
-        local response, status = rawRequest({ Url = url, Method = "GET" })
-        if status < 200 or status >= 300 then
-            serverListFailures = serverListFailures + 1
-            local retryAfter = tonumber(responseHeader(response, "retry-after"))
-            local cooldown = retryAfter or math.min(15, 2 ^ math.min(serverListFailures, 4))
-            serverListBackoffUntil = os.clock() + cooldown
-            warn("[Vichop/Searcher] Roblox server list failed:", status, "cooldown:", cooldown)
-            break
-        end
-        serverListFailures = 0
-        serverListBackoffUntil = 0
-        local page, ok = decodeBody(response)
-        if not ok or type(page) ~= "table" then
-            break
-        end
-        for _, server in ipairs(type(page.data) == "table" and page.data or {}) do
-            if type(server.id) == "string" and server.id ~= ""
-                and server.id ~= game.JobId
-                and tonumber(server.playing or 0) < tonumber(server.maxPlayers or 0) then
-                table.insert(results, server)
-            end
-        end
-        cursor = page.nextPageCursor
-        if not cursor then
-            break
-        end
-    end
-    return results
-end
-
-local function chooseAndReserveServer(excluded)
-    local activeServers, activeReadOk = firebaseGet("/activeServers.json")
-    if not activeReadOk then
-        return nil, "coordination_unavailable"
-    end
-    activeServers = activeServers or {}
-    local ownRecent = firebaseGet("/recentServers/" .. SEARCHER_ID .. ".json") or {}
-    local fleetRecent = firebaseGet("/fleetRecent.json") or {}
-    local timestamp = now()
-    local candidates = {}
-
-    for _, server in ipairs(getPublicServers()) do
-        local reservation = activeServers[server.id]
-        local occupied = reservationIsFresh(reservation, timestamp) and reservation.searcherId ~= SEARCHER_ID
-        if not occupied and not excluded[server.id] then
-            local ownAge = timestamp - tonumber(ownRecent[server.id] or 0)
-            local fleetRecord = fleetRecent[server.id]
-            local fleetCheckedAt = type(fleetRecord) == "table" and fleetRecord.checkedAt or fleetRecord
-            local fleetAge = timestamp - tonumber(fleetCheckedAt or 0)
-            table.insert(candidates, {
-                server = server,
-                ownRecent = ownAge >= 0 and ownAge < OWN_RECENT_TTL_SECONDS,
-                fleetRecent = fleetAge >= 0 and fleetAge < FLEET_RECENT_TTL_SECONDS,
-                playing = tonumber(server.playing or 0),
-                jitter = math.random(),
-            })
-        end
-    end
-
-    table.sort(candidates, function(a, b)
-        if a.ownRecent ~= b.ownRecent then
-            return not a.ownRecent
-        end
-        if a.fleetRecent ~= b.fleetRecent then
-            return not a.fleetRecent
-        end
-        if a.playing ~= b.playing then
-            return a.playing < b.playing
-        end
-        return a.jitter < b.jitter
-    end)
-
-    local limit = math.min(#candidates, MAX_RESERVATION_ATTEMPTS)
-    for index = 1, limit do
-        local jobId = candidates[index].server.id
-        local reserved, reason = reserveServer(jobId)
-        if reserved then
-            return jobId, "reserved"
-        end
-        if reason == "occupied" or reason == "contended" then
-            excluded[jobId] = true
-        end
-    end
-    return nil, "no_candidate"
-end
-
-local function queueLoader(targetJobId)
+local function queueLoader(previousJobId)
     if type(queueOnTeleport) ~= "function" then
         return
     end
     local loader = string.format(
-        'local e=(getgenv and getgenv() or _G);e.VICHOP_SEARCHER_ID=%q;e.__VICHOP_SEARCHER_PENDING={vichopRole="searcher",vichopSearcherId=%q,vichopExpectedJobId=%q,vichopFromJobId=%q,queuedAt=%d};loadstring(game:HttpGet("%s?t=" .. os.time()))()',
+        'local e=(getgenv and getgenv() or _G);e.VICHOP_SEARCHER_ID=%q;e.__VICHOP_SEARCHER_PENDING={vichopRole="searcher",vichopSearcherId=%q,vichopPreviousJobId=%q,vichopFromJobId=%q,rehopCount=%d,queuedAt=%d};loadstring(game:HttpGet("%s?t=" .. os.time()))()',
         SEARCHER_ID,
         SEARCHER_ID,
-        tostring(targetJobId),
-        game.JobId,
+        tostring(previousJobId),
+        tostring(previousJobId),
+        runtime.rehopCount,
         now(),
         LOADER_URL
     )
@@ -517,37 +428,38 @@ local function queueLoader(targetJobId)
     end
 end
 
-local function teleportData(targetJobId)
+local function matchmakingTeleportData(previousJobId)
     return {
         vichopRole = "searcher",
         vichopSearcherId = SEARCHER_ID,
-        vichopExpectedJobId = targetJobId,
-        vichopFromJobId = game.JobId,
+        vichopPreviousJobId = previousJobId,
+        vichopFromJobId = previousJobId,
+        vichopRehopCount = runtime.rehopCount,
         vichopTeleportedAt = now(),
     }
 end
 
-local function teleportToReservedServer(targetJobId)
-    runtime.expectedTarget = targetJobId
+local function genericTeleportOnce(reason, requestedAt, attempt)
     runtime.teleportError = nil
     runtime.teleportStarted = false
-    queueLoader(targetJobId)
+    queueLoader(game.JobId)
 
     local ok, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(
-            game.PlaceId,
-            targetJobId,
-            PLAYER,
-            nil,
-            teleportData(targetJobId)
-        )
+        local callLatency = os.clock() - requestedAt
+        print(string.format(
+            "[Vichop/Searcher] Matchmaking teleport call latency %.3fs | reason=%s | attempt=%d",
+            callLatency,
+            tostring(reason),
+            attempt
+        ))
+        TeleportService:Teleport(game.PlaceId, PLAYER, matchmakingTeleportData(game.JobId))
     end)
     if not ok then
         return false, tostring(err)
     end
 
     local deadline = os.clock() + TELEPORT_TIMEOUT_SECONDS
-    while runtime.active and os.clock() < deadline do
+    while runtimeIsCurrent() and os.clock() < deadline do
         if runtime.teleportError then
             return false, runtime.teleportError
         end
@@ -562,58 +474,93 @@ local function teleportToReservedServer(targetJobId)
     return false, "client remained in the same server"
 end
 
-local function hopServer(reason)
-    if runtime.hopping or not runtime.active then
+local function hopServer(reason, requestedAt)
+    if runtime.teleportControllerRunning or not runtimeIsCurrent() then
         return
     end
+    runtime.teleportControllerRunning = true
     runtime.hopping = true
-    print("[Vichop/Searcher] Hopping now:", reason)
 
-    local excluded = { [game.JobId] = true }
-    for attempt = 1, TELEPORT_RETRIES do
-        if not runtime.active then
-            runtime.hopping = false
+    if runtime.currentReservationOwned then
+        runtime.currentReservationOwned = false
+        task.spawn(releaseReservation, game.JobId)
+    end
+
+    if runtime.rehopCount >= COLLISION_JITTER_AFTER then
+        task.wait(0.1 + math.random() * 0.3)
+    end
+
+    local attempt = 0
+    local lastError = nil
+    while runtimeIsCurrent() do
+        attempt = attempt + 1
+        local attemptRequestedAt = attempt == 1 and requestedAt or os.clock()
+        local teleported, teleportError = genericTeleportOnce(reason, attemptRequestedAt, attempt)
+        if teleported then
             return
         end
-        local targetJobId, selectionReason = chooseAndReserveServer(excluded)
-        if not targetJobId then
-            warn("[Vichop/Searcher] No server selected:", selectionReason)
-            if selectionReason == "coordination_unavailable" then
-                serverStartedAt = now() + 10
-                break
-            end
-            task.wait(math.min(2, 0.5 * attempt))
-        else
-            if not runtime.active then
-                releaseReservation(targetJobId)
-                runtime.hopping = false
-                return
-            end
-            if runtime.currentReservationOwned then
-                releaseReservation(game.JobId)
-                runtime.currentReservationOwned = false
-            end
-            print("[Vichop/Searcher] Teleport attempt", attempt, "to", shortJobId(targetJobId))
-            local teleported, teleportError = teleportToReservedServer(targetJobId)
-            if teleported then
-                return
-            end
-            warn("[Vichop/Searcher] Teleport attempt failed:", tostring(teleportError))
-            releaseReservation(targetJobId)
-            excluded[targetJobId] = true
-            task.wait(math.min(2, 0.5 * attempt))
-        end
-    end
 
-    if not runtime.active then
-        runtime.hopping = false
+        if teleportError ~= lastError or attempt == 1 or attempt % 5 == 0 then
+            warn("[Vichop/Searcher] Matchmaking teleport failed; retrying:", tostring(teleportError))
+            lastError = teleportError
+        end
+        local backoff = math.min(TELEPORT_BACKOFF_MAX_SECONDS, 0.5 * (2 ^ math.min(attempt - 1, 3)))
+        task.wait(backoff)
+    end
+    runtime.hopping = false
+    runtime.teleportControllerRunning = false
+end
+
+local function requestHop(reason, isRehop)
+    if runtime.hopping or runtime.hopRequested or runtime.teleportControllerRunning or not runtimeIsCurrent() then
         return
     end
-    local reclaimed = reserveServer(game.JobId)
-    runtime.currentReservationOwned = reclaimed == true
-    runtime.hopping = false
-    serverStartedAt = now()
-    warn("[Vichop/Searcher] Hop retries exhausted; resuming this server")
+    if not isRehop then
+        runtime.rehopCount = 0
+    end
+    local requestedAt = os.clock()
+    runtime.hopRequested = true
+    task.spawn(function()
+        if not runtimeIsCurrent() then
+            return
+        end
+        runtime.hopRequested = false
+        hopServer(reason, requestedAt)
+    end)
+end
+
+local function validateArrivedServer(teleportContext)
+    local previousJobId = type(teleportContext) == "table"
+        and tostring(teleportContext.vichopPreviousJobId or teleportContext.vichopFromJobId or "") or ""
+    if previousJobId ~= "" and previousJobId == game.JobId then
+        return false, "matchmaking returned the previous server"
+    end
+
+    local ownRecent, ownRecentOk = firebaseGet("/recentServers/" .. SEARCHER_ID .. ".json")
+    local fleetRecent, fleetRecentOk = firebaseGet("/fleetRecent.json")
+    if not ownRecentOk or not fleetRecentOk then
+        return false, "recent-server history unavailable"
+    end
+
+    local timestamp = now()
+    local ownVisitedAt = tonumber(type(ownRecent) == "table" and ownRecent[game.JobId] or 0) or 0
+    if ownVisitedAt >= timestamp - OWN_RECENT_TTL_SECONDS then
+        return false, "server was recently checked by this searcher"
+    end
+    local fleetRecord = type(fleetRecent) == "table" and fleetRecent[game.JobId] or nil
+    local fleetVisitedAt = type(fleetRecord) == "table" and fleetRecord.checkedAt or fleetRecord
+    if tonumber(fleetVisitedAt or 0) >= timestamp - FLEET_RECENT_TTL_SECONDS then
+        return false, "server was recently checked by the fleet"
+    end
+
+    local reserved, reserveReason = reserveServer(game.JobId)
+    if not reserved then
+        return false, "reservation rejected: " .. tostring(reserveReason)
+    end
+    runtime.currentReservationOwned = true
+    runtime.rehopCount = 0
+    markVisited(game.JobId)
+    return true, "reserved"
 end
 
 local function expireOldData()
@@ -703,45 +650,53 @@ local function getJoinTeleportData()
 end
 
 local teleportDataOnJoin = getJoinTeleportData()
-if teleportDataOnJoin.vichopRole == "searcher"
-    and teleportDataOnJoin.vichopExpectedJobId
-    and tostring(teleportDataOnJoin.vichopExpectedJobId) ~= game.JobId then
-    warn("[Vichop/Searcher] Roblox joined the wrong server; releasing the abandoned reservation")
-    releaseReservation(tostring(teleportDataOnJoin.vichopExpectedJobId))
+if teleportDataOnJoin.vichopRole == "searcher" then
+    runtime.previousJobId = tostring(
+        teleportDataOnJoin.vichopPreviousJobId or teleportDataOnJoin.vichopFromJobId or ""
+    )
+    runtime.rehopCount = math.max(0, tonumber(
+        teleportDataOnJoin.rehopCount or teleportDataOnJoin.vichopRehopCount or runtime.rehopCount
+    ) or 0)
 end
 
 local teleportConnection = TeleportService.TeleportInitFailed:Connect(function(player, result, message)
-    if player == PLAYER and runtime.active then
+    if player == PLAYER and runtimeIsCurrent() then
         runtime.teleportError = tostring(result) .. ": " .. tostring(message)
     end
 end)
 
 local playerTeleportConnection = PLAYER.OnTeleport:Connect(function(state)
-    if state == Enum.TeleportState.Started then
+    if state == Enum.TeleportState.Started and env.__VICHOP_SEARCHER_RUNTIME == runtime then
         runtime.teleportStarted = true
         runtime.active = false
     end
 end)
 
 local function runSearcher()
-    local reserved, reserveReason = reserveServer(game.JobId)
-    runtime.currentReservationOwned = reserved
-    if not reserved then
-        warn("[Vichop/Searcher] Could not reserve the current server:", reserveReason)
-        task.spawn(hopServer, "current server reservation unavailable")
-    else
-        markVisited(game.JobId)
+    local arrivedValid, arrivalReason = validateArrivedServer(teleportDataOnJoin)
+    runtime.arrivalStatus = arrivalReason
+    if not arrivedValid then
+        runtime.rehopCount = runtime.rehopCount + 1
+        print("[Vichop/Searcher] Rehopping immediately:", arrivalReason)
+        task.spawn(releaseReservation, game.JobId)
+        requestHop("arrival rejected: " .. arrivalReason, true)
+        while runtimeIsCurrent() do
+            task.wait(SCAN_INTERVAL_SECONDS)
+        end
+        return
     end
+    serverStartedAtClock = os.clock()
 
     task.spawn(function()
-        while runtime.active do
+        while runtimeIsCurrent() do
             task.wait(HEARTBEAT_SECONDS)
-            if runtime.active and not runtime.hopping and runtime.currentReservationOwned then
+            if runtimeIsCurrent() and not runtime.hopping and runtime.currentReservationOwned then
                 local heartbeatOk = heartbeatReservation(game.JobId)
                 if not heartbeatOk then
                     runtime.currentReservationOwned = false
                     warn("[Vichop/Searcher] Lost this server reservation")
-                    task.spawn(hopServer, "reservation lease lost")
+                    runtime.rehopCount = runtime.rehopCount + 1
+                    requestHop("reservation lease lost", true)
                 end
             end
         end
@@ -750,7 +705,7 @@ local function runSearcher()
     print("[Vichop/Searcher] Running", SEARCHER_ID, "in", shortJobId(game.JobId))
 
     local lastVicious = nil
-    while runtime.active do
+    while runtimeIsCurrent() do
         if not runtime.hopping then
             local monster, level = getVicious()
             if monster then
@@ -762,9 +717,9 @@ local function runSearcher()
             elseif lastVicious then
                 print("[Vichop/Searcher] Vicious disappeared; leaving immediately")
                 task.spawn(reportMissing)
-                task.spawn(hopServer, "Vicious disappeared")
-            elseif now() - serverStartedAt >= INITIAL_SCAN_SECONDS then
-                task.spawn(hopServer, "no live Vicious found")
+                requestHop("Vicious disappeared", false)
+            elseif os.clock() - serverStartedAtClock >= INITIAL_SCAN_SECONDS then
+                requestHop("no live Vicious found", false)
             end
             lastVicious = monster
 
