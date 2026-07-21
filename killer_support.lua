@@ -21,6 +21,7 @@ local CLAIM_LEASE_SECONDS = 30
 local CLAIM_HEARTBEAT_SECONDS = 5
 local CLEANUP_INTERVAL_SECONDS = 30
 local TERMINAL_RETENTION_SECONDS = 60 * 60
+local HTTP_TIMEOUT_SECONDS = 15
 local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_RETRIES = 3
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
@@ -264,6 +265,7 @@ local function responseHeader(response, wantedName)
 end
 
 local function rawRequest(options)
+    options.Timeout = options.Timeout or HTTP_TIMEOUT_SECONDS
     local ok, response = pcall(httpRequest, options)
     if not ok or type(response) ~= "table" then
         warn("[Vichop/Killer] HTTP request failed:", tostring(response))
@@ -533,6 +535,7 @@ local function sendWebhook(report)
         local ok, response = pcall(httpRequest, {
             Url = DISCORD_WEBHOOK_URL,
             Method = "POST",
+            Timeout = HTTP_TIMEOUT_SECONDS,
             Headers = { ["Content-Type"] = "application/json" },
             Body = HttpService:JSONEncode(payload),
         })
