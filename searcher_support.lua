@@ -7,9 +7,12 @@ local TeleportService = game:GetService("TeleportService")
 
 local BSS_PLACE_ID = 1537690962
 local DATABASE_URL = "https://bss-job-queue-7bf75-default-rtdb.firebaseio.com"
+local ROBLOX_SERVER_LIST_URL = "https://games.roblox.com/v1/games/" .. tostring(BSS_PLACE_ID)
+    .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
 local INITIAL_SCAN_SECONDS = 5
 local SCAN_INTERVAL_SECONDS = 0.25
 local HEARTBEAT_SECONDS = 5
+local RESERVATION_HEARTBEAT_SECONDS = 3
 local RESERVATION_TTL_SECONDS = 20
 local OWN_RECENT_TTL_SECONDS = 10 * 60
 local FLEET_RECENT_TTL_SECONDS = 45
@@ -17,7 +20,13 @@ local JOB_STALE_SECONDS = 35
 local CLEANUP_INTERVAL_SECONDS = 30
 local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_BACKOFF_MAX_SECONDS = 3
-local COLLISION_JITTER_AFTER = 3
+local CANDIDATE_TTL_SECONDS = 3 * 60
+local CANDIDATE_POOL_TARGET = 35
+local CANDIDATE_POOL_MAX = 120
+local CANDIDATE_RESERVATION_ATTEMPTS = 12
+local REFILL_LEASE_SECONDS = 15
+local REFILL_PAGES_PER_LEASE = 2
+local REFILL_RETRY_SECONDS = 2
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
 
@@ -73,9 +82,21 @@ local runtime = {
     teleportError = nil,
     currentReservationOwned = false,
     cleanupRunning = false,
-    rehopCount = 0,
     previousJobId = "",
+    expectedJobId = "",
     arrivalStatus = "pending",
+    nextHop = nil,
+    preparing = false,
+    refillRunning = false,
+    backgroundRequests = 0,
+    httpRequests = 0,
+    stopBackground = false,
+    waitingLogged = false,
+    holdPosition = false,
+    state = "STARTING",
+    serverListRequests = 0,
+    saw429 = false,
+    hopRecords = {},
 }
 env.__VICHOP_SEARCHER_RUNTIME = runtime
 
@@ -116,7 +137,7 @@ local function readResumeContext()
     return saved
 end
 
-local function writeResumeContext(previousJobId)
+local function writeResumeContext(previousJobId, expectedJobId, prepared, requestedAt)
     if type(writefile) ~= "function" then
         warn("[Vichop/Searcher] Local resume file is unavailable; previous JobId cannot persist")
         return false
@@ -124,9 +145,20 @@ local function writeResumeContext(previousJobId)
     local encodeOk, encoded = pcall(HttpService.JSONEncode, HttpService, {
         vichopRole = "searcher",
         vichopSearcherId = SEARCHER_ID,
+        searcherId = SEARCHER_ID,
         vichopPreviousJobId = previousJobId,
         vichopFromJobId = previousJobId,
-        vichopRehopCount = runtime.rehopCount,
+        vichopExpectedJobId = expectedJobId,
+        fromJobId = previousJobId,
+        expectedJobId = expectedJobId,
+        candidateSource = prepared and prepared.source or nil,
+        preparedAt = prepared and prepared.reservedAt or nil,
+        preparedBeforeDecision = prepared and requestedAt
+            and prepared.reservedAtClock <= requestedAt or false,
+        decisionToCallLatency = requestedAt and (os.clock() - requestedAt) or nil,
+        serverListRequests = runtime.serverListRequests,
+        saw429 = runtime.saw429,
+        teleportedAt = now(),
         savedAt = now(),
     })
     if not encodeOk then
@@ -142,6 +174,36 @@ end
 
 local function runtimeIsCurrent()
     return runtime.active and env.__VICHOP_SEARCHER_RUNTIME == runtime
+end
+
+local function beginBackgroundRequest()
+    if runtime.stopBackground or not runtimeIsCurrent() then
+        return false
+    end
+    runtime.backgroundRequests = runtime.backgroundRequests + 1
+    return true
+end
+
+local function finishBackgroundRequest()
+    runtime.backgroundRequests = math.max(0, runtime.backgroundRequests - 1)
+end
+
+local function runBackground(label, callback)
+    if not beginBackgroundRequest() then
+        return false
+    end
+    local ok, result = xpcall(callback, function(message)
+        if debug and type(debug.traceback) == "function" then
+            return debug.traceback(tostring(message))
+        end
+        return tostring(message)
+    end)
+    finishBackgroundRequest()
+    if not ok then
+        warn("[Vichop/Searcher] Background " .. label .. " failed:", tostring(result))
+        return false
+    end
+    return true, result
 end
 
 local function shortJobId(jobId)
@@ -172,7 +234,9 @@ local function responseHeader(response, wantedName)
 end
 
 local function rawRequest(options)
+    runtime.httpRequests = runtime.httpRequests + 1
     local ok, response = pcall(httpRequest, options)
+    runtime.httpRequests = math.max(0, runtime.httpRequests - 1)
     if not ok or type(response) ~= "table" then
         warn("[Vichop/Searcher] HTTP request failed:", tostring(response))
         return nil, 0
@@ -345,13 +409,310 @@ end
 
 local function markVisited(jobId)
     local timestamp = now()
-    task.spawn(function()
-        firebaseWrite("PUT", "/recentServers/" .. SEARCHER_ID .. "/" .. tostring(jobId) .. ".json", timestamp)
-        firebaseWrite("PUT", "/fleetRecent/" .. tostring(jobId) .. ".json", {
+    firebaseWrite("PUT", "/recentServers/" .. SEARCHER_ID .. "/" .. tostring(jobId) .. ".json", timestamp)
+    firebaseWrite("PUT", "/fleetRecent/" .. tostring(jobId) .. ".json", {
+        searcherId = SEARCHER_ID,
+        checkedAt = timestamp,
+        placeId = game.PlaceId,
+    })
+end
+
+local function candidatePath(jobId)
+    return "/candidatePool/" .. tostring(jobId) .. ".json"
+end
+
+local function stableCandidateScore(jobId)
+    local value = SEARCHER_ID .. ":" .. tostring(jobId)
+    local score = 5381
+    for index = 1, #value do
+        score = (score * 33 + string.byte(value, index)) % 2147483647
+    end
+    return score
+end
+
+local function candidateIsFresh(candidate, timestamp)
+    return type(candidate) == "table"
+        and type(candidate.jobId) == "string"
+        and candidate.jobId ~= ""
+        and tonumber(candidate.placeId) == game.PlaceId
+        and tonumber(candidate.discoveredAt or 0) >= timestamp - CANDIDATE_TTL_SECONDS
+        and tonumber(candidate.playing or 0) < tonumber(candidate.maxPlayers or 0)
+end
+
+local function acquireRefillLease()
+    local timestamp = now()
+    local leaseId = runtime.generation .. ":" .. tostring(timestamp)
+    local acquired, reason = atomicMutate("/candidatePoolMeta/refillLease.json", function(current)
+        if type(current) == "table" and tonumber(current.expiresAt or 0) > timestamp
+            and current.searcherId ~= SEARCHER_ID then
+            return nil, "lease_held"
+        end
+        return {
             searcherId = SEARCHER_ID,
-            checkedAt = timestamp,
-            placeId = game.PlaceId,
+            leaseId = leaseId,
+            acquiredAt = timestamp,
+            heartbeatAt = timestamp,
+            expiresAt = timestamp + REFILL_LEASE_SECONDS,
+        }, "lease_acquired"
+    end, 3)
+    return acquired and leaseId or nil, reason
+end
+
+local function releaseRefillLease(leaseId)
+    return atomicDeleteIf("/candidatePoolMeta/refillLease.json", function(current)
+        return type(current) == "table" and current.searcherId == SEARCHER_ID
+            and current.leaseId == leaseId
+    end)
+end
+
+local function pruneCandidatePool(pool)
+    local timestamp = now()
+    local entries = {}
+    for jobId, candidate in pairs(type(pool) == "table" and pool or {}) do
+        table.insert(entries, {
+            jobId = jobId,
+            stale = not candidateIsFresh(candidate, timestamp),
+            discoveredAt = tonumber(type(candidate) == "table" and candidate.discoveredAt or 0) or 0,
         })
+    end
+    table.sort(entries, function(a, b)
+        if a.stale ~= b.stale then
+            return a.stale
+        end
+        return a.discoveredAt < b.discoveredAt
+    end)
+
+    local staleCount = 0
+    for index = 1, #entries do
+        if entries[index].stale then
+            staleCount = staleCount + 1
+        end
+    end
+    local removeCount = math.min(30, #entries, math.max(staleCount, #entries - CANDIDATE_POOL_MAX))
+    for index = 1, removeCount do
+        firebaseWrite("DELETE", candidatePath(entries[index].jobId))
+        pool[entries[index].jobId] = nil
+    end
+
+    local remaining = 0
+    local fresh = 0
+    for _, candidate in pairs(pool) do
+        remaining = remaining + 1
+        if candidateIsFresh(candidate, timestamp) then
+            fresh = fresh + 1
+        end
+    end
+    return remaining, fresh
+end
+
+local function refillCandidatePool()
+    if runtime.refillRunning or runtime.stopBackground or not runtimeIsCurrent() then
+        return false, "refill_unavailable"
+    end
+    runtime.refillRunning = true
+
+    local jitter = 0.05 + (stableCandidateScore(runtime.generation) % 300) / 1000
+    task.wait(jitter)
+    if runtime.stopBackground or not runtimeIsCurrent() then
+        runtime.refillRunning = false
+        return false, "refill_stopped"
+    end
+
+    local pool, poolReadOk = firebaseGet("/candidatePool.json")
+    if not poolReadOk then
+        runtime.refillRunning = false
+        return false, "pool_unavailable"
+    end
+    pool = type(pool) == "table" and pool or {}
+    local poolSize, freshCount = pruneCandidatePool(pool)
+    if freshCount >= CANDIDATE_POOL_TARGET then
+        runtime.refillRunning = false
+        return true, "pool_ready"
+    end
+
+    local cooldownUntil = tonumber(firebaseGet("/candidatePoolMeta/cooldownUntil.json") or 0) or 0
+    if cooldownUntil > now() then
+        runtime.refillRunning = false
+        return false, "cooldown"
+    end
+
+    local leaseId, leaseReason = acquireRefillLease()
+    if not leaseId then
+        runtime.refillRunning = false
+        return false, leaseReason
+    end
+
+    local cursorValue = firebaseGet("/candidatePoolMeta/nextCursor.json")
+    local cursor = type(cursorValue) == "string" and cursorValue ~= "" and cursorValue or nil
+    local writeBudget = math.max(0, CANDIDATE_POOL_MAX - poolSize)
+    local refillOk = false
+    local refillReason = "empty_response"
+
+    for _ = 1, REFILL_PAGES_PER_LEASE do
+        if runtime.stopBackground or not runtimeIsCurrent() or writeBudget <= 0 then
+            break
+        end
+        local url = ROBLOX_SERVER_LIST_URL
+        if cursor then
+            url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
+        end
+        runtime.serverListRequests = runtime.serverListRequests + 1
+        local response, status = rawRequest({ Url = url, Method = "GET" })
+        if status == 429 then
+            runtime.saw429 = true
+            local retryAfter = tonumber(responseHeader(response, "retry-after")) or 10
+            firebaseWrite("PUT", "/candidatePoolMeta/cooldownUntil.json", now() + math.max(1, retryAfter))
+            refillReason = "rate_limited"
+            break
+        end
+        if status < 200 or status >= 300 then
+            firebaseWrite("PUT", "/candidatePoolMeta/cooldownUntil.json", now() + REFILL_RETRY_SECONDS)
+            refillReason = "server_list_" .. tostring(status)
+            break
+        end
+
+        local page, decoded = decodeBody(response)
+        if not decoded or type(page) ~= "table" then
+            refillReason = "invalid_server_page"
+            break
+        end
+
+        local writes = {}
+        local writeCount = 0
+        for _, server in ipairs(type(page.data) == "table" and page.data or {}) do
+            local jobId = type(server.id) == "string" and server.id or ""
+            if writeCount < writeBudget and jobId ~= "" and jobId ~= game.JobId
+                and tonumber(server.playing or 0) < tonumber(server.maxPlayers or 0) then
+                writes[jobId] = {
+                    jobId = jobId,
+                    placeId = game.PlaceId,
+                    playing = tonumber(server.playing or 0),
+                    maxPlayers = tonumber(server.maxPlayers or 0),
+                    discoveredAt = now(),
+                    discoveredBy = SEARCHER_ID,
+                }
+                writeCount = writeCount + 1
+            end
+        end
+        if writeCount > 0 then
+            firebaseWrite("PATCH", "/candidatePool.json", writes)
+            writeBudget = writeBudget - writeCount
+            refillOk = true
+            refillReason = "refilled"
+        end
+
+        cursor = type(page.nextPageCursor) == "string" and page.nextPageCursor ~= ""
+            and page.nextPageCursor or nil
+        firebaseWrite("PUT", "/candidatePoolMeta/nextCursor.json", cursor or "")
+        firebaseWrite("PUT", "/candidatePoolMeta/lastRefillAt.json", now())
+        if not cursor then
+            firebaseWrite("PUT", "/candidatePoolMeta/cooldownUntil.json", now() + 20)
+            break
+        end
+    end
+
+    releaseRefillLease(leaseId)
+    runtime.refillRunning = false
+    return refillOk, refillReason
+end
+
+local function prepareFromCandidatePool()
+    local pool, poolOk = firebaseGet("/candidatePool.json")
+    local ownRecent, ownRecentOk = firebaseGet("/recentServers/" .. SEARCHER_ID .. ".json")
+    local fleetRecent, fleetRecentOk = firebaseGet("/fleetRecent.json")
+    if not poolOk or not ownRecentOk or not fleetRecentOk then
+        return false, "coordination_unavailable"
+    end
+    pool = type(pool) == "table" and pool or {}
+    ownRecent = type(ownRecent) == "table" and ownRecent or {}
+    fleetRecent = type(fleetRecent) == "table" and fleetRecent or {}
+
+    local timestamp = now()
+    local candidates = {}
+    for jobId, candidate in pairs(pool) do
+        local fleetRecord = fleetRecent[jobId]
+        local fleetCheckedAt = type(fleetRecord) == "table" and fleetRecord.checkedAt or fleetRecord
+        local ownVisitedAt = tonumber(ownRecent[jobId] or 0) or 0
+        local fleetVisitedAt = tonumber(fleetCheckedAt or 0) or 0
+        if candidateIsFresh(candidate, timestamp)
+            and jobId ~= game.JobId
+            and jobId ~= runtime.previousJobId
+            and jobId ~= runtime.expectedJobId
+            and ownVisitedAt < timestamp - OWN_RECENT_TTL_SECONDS
+            and fleetVisitedAt < timestamp - FLEET_RECENT_TTL_SECONDS then
+            table.insert(candidates, {
+                jobId = jobId,
+                candidate = candidate,
+                score = stableCandidateScore(jobId),
+                playing = tonumber(candidate.playing or 0),
+            })
+        end
+    end
+    table.sort(candidates, function(a, b)
+        if a.score ~= b.score then
+            return a.score < b.score
+        end
+        return a.playing < b.playing
+    end)
+
+    for index = 1, math.min(#candidates, CANDIDATE_RESERVATION_ATTEMPTS) do
+        local selected = candidates[index]
+        local reserved, reserveReason = reserveServer(selected.jobId)
+        if reserved then
+            if runtime.stopBackground or runtime.holdPosition or not runtimeIsCurrent() then
+                releaseReservation(selected.jobId)
+                return false, "preparation_cancelled"
+            end
+            runtime.nextHop = {
+                jobId = selected.jobId,
+                reservedAt = timestamp,
+                reservedAtClock = os.clock(),
+                expiresAt = timestamp + RESERVATION_TTL_SECONDS,
+                source = selected.candidate.discoveredBy == SEARCHER_ID and "local" or "firebase",
+                reservationResult = reserveReason,
+            }
+            firebaseWrite("DELETE", candidatePath(selected.jobId))
+            print("[Vichop/Searcher] Prepared", shortJobId(selected.jobId), runtime.nextHop.source)
+            return true, "prepared"
+        end
+    end
+    return false, #candidates == 0 and "pool_empty" or "reservation_race"
+end
+
+local function ensureNextHop()
+    if runtime.nextHop or runtime.preparing or runtime.stopBackground or runtime.holdPosition
+        or not runtimeIsCurrent() then
+        return
+    end
+    runtime.preparing = true
+    task.spawn(function()
+        runBackground("destination preparation", function()
+            while runtimeIsCurrent() and not runtime.stopBackground and not runtime.holdPosition
+                and not runtime.nextHop do
+                local prepared = prepareFromCandidatePool()
+                if prepared then
+                    break
+                end
+                refillCandidatePool()
+                if not runtime.nextHop and runtimeIsCurrent() and not runtime.stopBackground then
+                    task.wait(REFILL_RETRY_SECONDS)
+                end
+            end
+        end)
+        runtime.preparing = false
+    end)
+end
+
+local function releasePreparedDestination()
+    local prepared = runtime.nextHop
+    runtime.nextHop = nil
+    if not prepared then
+        return
+    end
+    task.spawn(function()
+        runBackground("prepared reservation release", function()
+            releaseReservation(prepared.jobId)
+        end)
     end)
 end
 
@@ -465,20 +826,38 @@ local function reportMissing()
     end, 3)
 end
 
-local function genericTeleportOnce(reason, requestedAt, attempt)
+local function teleportToPreparedServer(prepared, reason, requestedAt, attempt)
+    if not prepared or prepared.jobId == game.JobId then
+        return false, "prepared destination is not different"
+    end
     runtime.teleportError = nil
     runtime.teleportStarted = false
-    writeResumeContext(game.JobId)
+    runtime.expectedJobId = prepared.jobId
+
+    writeResumeContext(game.JobId, prepared.jobId, prepared, requestedAt)
+    local callLatency = os.clock() - requestedAt
+    table.insert(runtime.hopRecords, {
+        previousJobId = game.JobId,
+        expectedJobId = prepared.jobId,
+        preparedBeforeDecision = prepared.reservedAtClock <= requestedAt,
+        callLatency = callLatency,
+        candidateSource = prepared.source,
+        reservationResult = prepared.reservationResult,
+        serverListRequests = runtime.serverListRequests,
+        saw429 = runtime.saw429,
+    })
+    print(string.format(
+        "[Vichop/Searcher] Prepared teleport call latency %.3fs | from=%s | expected=%s | source=%s | attempt=%d | reason=%s",
+        callLatency,
+        shortJobId(game.JobId),
+        shortJobId(prepared.jobId),
+        tostring(prepared.source),
+        attempt,
+        tostring(reason)
+    ))
 
     local ok, err = pcall(function()
-        local callLatency = os.clock() - requestedAt
-        print(string.format(
-            "[Vichop/Searcher] Matchmaking teleport call latency %.3fs | reason=%s | attempt=%d",
-            callLatency,
-            tostring(reason),
-            attempt
-        ))
-        TeleportService:Teleport(game.PlaceId)
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, prepared.jobId, PLAYER)
     end)
     if not ok then
         return false, tostring(err)
@@ -506,43 +885,95 @@ local function hopServer(reason, requestedAt)
     end
     runtime.teleportControllerRunning = true
     runtime.hopping = true
-
-    if runtime.currentReservationOwned then
-        runtime.currentReservationOwned = false
-        releaseReservation(game.JobId)
-    end
-
-    if runtime.rehopCount >= COLLISION_JITTER_AFTER then
-        task.wait(0.1 + math.random() * 0.3)
-    end
+    runtime.state = "PREPARING_TO_TELEPORT"
 
     local attempt = 0
     local lastError = nil
     while runtimeIsCurrent() do
-        attempt = attempt + 1
-        local attemptRequestedAt = attempt == 1 and requestedAt or os.clock()
-        local teleported, teleportError = genericTeleportOnce(reason, attemptRequestedAt, attempt)
-        if teleported then
-            return
-        end
+        local prepared = runtime.nextHop
+        if not prepared then
+            runtime.stopBackground = false
+            runtime.state = "WAITING_FOR_DESTINATION"
+            if not runtime.waitingLogged then
+                print("[Vichop/Searcher] Waiting for a guaranteed different destination")
+                runtime.waitingLogged = true
+            end
+            ensureNextHop()
+            task.wait(0.1)
+        elseif prepared.jobId == game.JobId or prepared.jobId == runtime.previousJobId then
+            runtime.nextHop = nil
+            runtime.stopBackground = false
+            task.spawn(function()
+                runBackground("invalid prepared release", function()
+                    releaseReservation(prepared.jobId)
+                end)
+            end)
+            ensureNextHop()
+        else
+            runtime.waitingLogged = false
+            runtime.stopBackground = true
+            runtime.state = "DRAINING_BACKGROUND"
+            while runtimeIsCurrent() and (runtime.backgroundRequests > 0 or runtime.httpRequests > 0) do
+                task.wait(0.02)
+            end
+            if not runtimeIsCurrent() then
+                return
+            end
+            if runtime.nextHop ~= prepared then
+                runtime.stopBackground = false
+            else
+                attempt = attempt + 1
+                runtime.state = "TELEPORTING"
+                runtime.currentReservationOwned = false
+                local attemptRequestedAt = attempt == 1 and requestedAt or os.clock()
+                local teleported, teleportError = teleportToPreparedServer(
+                    prepared,
+                    reason,
+                    attemptRequestedAt,
+                    attempt
+                )
+                if teleported then
+                    return
+                end
 
-        if teleportError ~= lastError or attempt == 1 or attempt % 5 == 0 then
-            warn("[Vichop/Searcher] Matchmaking teleport failed; retrying:", tostring(teleportError))
-            lastError = teleportError
+                runtime.stopBackground = false
+                if teleportError ~= lastError or attempt == 1 or attempt % 5 == 0 then
+                    warn("[Vichop/Searcher] Explicit teleport failed; retrying:", tostring(teleportError))
+                    lastError = teleportError
+                end
+                if attempt % 2 == 0 then
+                    runtime.nextHop = nil
+                    task.spawn(function()
+                        runBackground("failed destination release", function()
+                            releaseReservation(prepared.jobId)
+                        end)
+                    end)
+                    ensureNextHop()
+                else
+                    runBackground("prepared reservation refresh", function()
+                        local reserved, reserveReason = reserveServer(prepared.jobId)
+                        if reserved then
+                            prepared.reservedAt = now()
+                            prepared.reservedAtClock = os.clock()
+                            prepared.expiresAt = now() + RESERVATION_TTL_SECONDS
+                            prepared.reservationResult = reserveReason
+                        else
+                            runtime.nextHop = nil
+                        end
+                    end)
+                end
+                local backoff = math.min(TELEPORT_BACKOFF_MAX_SECONDS, 0.5 * (2 ^ math.min(attempt - 1, 3)))
+                task.wait(backoff)
+            end
         end
-        local backoff = math.min(TELEPORT_BACKOFF_MAX_SECONDS, 0.5 * (2 ^ math.min(attempt - 1, 3)))
-        task.wait(backoff)
     end
     runtime.hopping = false
     runtime.teleportControllerRunning = false
 end
 
-local function requestHop(reason, isRehop)
-    if runtime.hopping or runtime.hopRequested or runtime.teleportControllerRunning or not runtimeIsCurrent() then
+local function requestHop(reason)
+    if runtime.hopRequested or runtime.teleportControllerRunning or not runtimeIsCurrent() then
         return
-    end
-    if not isRehop then
-        runtime.rehopCount = 0
     end
     local requestedAt = os.clock()
     runtime.hopRequested = true
@@ -557,9 +988,15 @@ end
 
 local function validateArrivedServer(teleportContext)
     local previousJobId = type(teleportContext) == "table"
-        and tostring(teleportContext.vichopPreviousJobId or teleportContext.vichopFromJobId or "") or ""
+        and tostring(teleportContext.vichopPreviousJobId or teleportContext.vichopFromJobId
+            or teleportContext.fromJobId or "") or ""
+    local expectedJobId = type(teleportContext) == "table"
+        and tostring(teleportContext.vichopExpectedJobId or teleportContext.expectedJobId or "") or ""
     if previousJobId ~= "" and previousJobId == game.JobId then
-        return false, "matchmaking returned the previous server"
+        return false, "explicit teleport returned the previous server"
+    end
+    if expectedJobId ~= "" and expectedJobId ~= game.JobId then
+        return false, "arrived in a different server than the prepared destination"
     end
 
     local ownRecent, ownRecentOk = firebaseGet("/recentServers/" .. SEARCHER_ID .. ".json")
@@ -584,9 +1021,8 @@ local function validateArrivedServer(teleportContext)
         return false, "reservation rejected: " .. tostring(reserveReason)
     end
     runtime.currentReservationOwned = true
-    runtime.rehopCount = 0
     markVisited(game.JobId)
-    return true, "reserved"
+    return true, expectedJobId ~= "" and "expected destination reserved" or "initial server reserved"
 end
 
 local function expireOldData()
@@ -647,16 +1083,13 @@ local function expireOldData()
 end
 
 local function scheduleCleanup()
-    if runtime.cleanupRunning then
+    if runtime.cleanupRunning or runtime.stopBackground then
         return
     end
     runtime.cleanupRunning = true
     task.spawn(function()
-        local ok, err = pcall(expireOldData)
+        runBackground("cleanup", expireOldData)
         runtime.cleanupRunning = false
-        if not ok then
-            warn("[Vichop/Searcher] Cleanup failed:", tostring(err))
-        end
     end)
 end
 
@@ -672,11 +1105,30 @@ end
 local teleportDataOnJoin = getJoinTeleportData()
 if teleportDataOnJoin.vichopRole == "searcher" then
     runtime.previousJobId = tostring(
-        teleportDataOnJoin.vichopPreviousJobId or teleportDataOnJoin.vichopFromJobId or ""
+        teleportDataOnJoin.vichopPreviousJobId or teleportDataOnJoin.vichopFromJobId
+            or teleportDataOnJoin.fromJobId or ""
     )
-    runtime.rehopCount = math.max(0, tonumber(
-        teleportDataOnJoin.rehopCount or teleportDataOnJoin.vichopRehopCount or runtime.rehopCount
-    ) or 0)
+    runtime.expectedJobId = tostring(
+        teleportDataOnJoin.vichopExpectedJobId or teleportDataOnJoin.expectedJobId or ""
+    )
+    runtime.lastArrival = {
+        previousJobId = runtime.previousJobId,
+        expectedJobId = runtime.expectedJobId,
+        actualJobId = game.JobId,
+        preparedBeforeDecision = teleportDataOnJoin.preparedBeforeDecision == true,
+        callLatency = tonumber(teleportDataOnJoin.decisionToCallLatency),
+        candidateSource = teleportDataOnJoin.candidateSource,
+        serverListRequests = tonumber(teleportDataOnJoin.serverListRequests or 0) or 0,
+        saw429 = teleportDataOnJoin.saw429 == true,
+    }
+    print(string.format(
+        "[Vichop/Searcher] Arrival from=%s expected=%s actual=%s latency=%s source=%s",
+        shortJobId(runtime.previousJobId),
+        shortJobId(runtime.expectedJobId),
+        shortJobId(game.JobId),
+        runtime.lastArrival.callLatency and string.format("%.3f", runtime.lastArrival.callLatency) or "n/a",
+        tostring(runtime.lastArrival.candidateSource or "n/a")
+    ))
 end
 
 local teleportConnection = TeleportService.TeleportInitFailed:Connect(function(player, result, message)
@@ -696,27 +1148,51 @@ local function runSearcher()
     local arrivedValid, arrivalReason = validateArrivedServer(teleportDataOnJoin)
     runtime.arrivalStatus = arrivalReason
     if not arrivedValid then
-        runtime.rehopCount = runtime.rehopCount + 1
-        print("[Vichop/Searcher] Rehopping immediately:", arrivalReason)
-        requestHop("arrival rejected: " .. arrivalReason, true)
+        print("[Vichop/Searcher] Arrival rejected; preparing explicit destination:", arrivalReason)
+        if runtime.expectedJobId ~= "" and runtime.expectedJobId ~= game.JobId then
+            local abandonedJobId = runtime.expectedJobId
+            task.spawn(function()
+                runBackground("abandoned destination release", function()
+                    releaseReservation(abandonedJobId)
+                end)
+            end)
+        end
+        ensureNextHop()
+        requestHop("arrival rejected: " .. arrivalReason)
         while runtimeIsCurrent() do
             task.wait(SCAN_INTERVAL_SECONDS)
         end
         return
     end
     serverStartedAtClock = os.clock()
+    runtime.state = "SCANNING"
+    ensureNextHop()
 
     task.spawn(function()
         while runtimeIsCurrent() do
-            task.wait(HEARTBEAT_SECONDS)
-            if runtimeIsCurrent() and not runtime.hopping and runtime.currentReservationOwned then
-                local heartbeatOk = heartbeatReservation(game.JobId)
-                if not heartbeatOk then
-                    runtime.currentReservationOwned = false
-                    warn("[Vichop/Searcher] Lost this server reservation")
-                    runtime.rehopCount = runtime.rehopCount + 1
-                    requestHop("reservation lease lost", true)
-                end
+            task.wait(RESERVATION_HEARTBEAT_SECONDS)
+            if runtimeIsCurrent() and not runtime.stopBackground then
+                runBackground("reservation heartbeat", function()
+                    if runtime.currentReservationOwned then
+                        local heartbeatOk = heartbeatReservation(game.JobId)
+                        if not heartbeatOk then
+                            runtime.currentReservationOwned = false
+                            warn("[Vichop/Searcher] Lost this server reservation")
+                            requestHop("current reservation lease lost")
+                        end
+                    end
+                    local prepared = runtime.nextHop
+                    if prepared then
+                        local preparedOk = heartbeatReservation(prepared.jobId)
+                        if preparedOk then
+                            prepared.expiresAt = now() + RESERVATION_TTL_SECONDS
+                        elseif runtime.nextHop == prepared then
+                            runtime.nextHop = nil
+                            warn("[Vichop/Searcher] Lost the prepared destination reservation")
+                            ensureNextHop()
+                        end
+                    end
+                end)
             end
         end
     end)
@@ -729,16 +1205,22 @@ local function runSearcher()
             local monster, level = getVicious()
             if monster then
                 if not lastVicious then
+                    runtime.holdPosition = true
+                    releasePreparedDestination()
                     publishSpawn(monster, level)
                 elseif now() - lastJobHeartbeat >= HEARTBEAT_SECONDS then
                     heartbeatJob(monster, level)
                 end
             elseif lastVicious then
                 print("[Vichop/Searcher] Vicious disappeared; leaving immediately")
-                task.spawn(reportMissing)
-                requestHop("Vicious disappeared", false)
+                runtime.holdPosition = false
+                task.spawn(function()
+                    runBackground("missing report", reportMissing)
+                end)
+                ensureNextHop()
+                requestHop("Vicious disappeared")
             elseif os.clock() - serverStartedAtClock >= INITIAL_SCAN_SECONDS then
-                requestHop("no live Vicious found", false)
+                requestHop("no live Vicious found")
             end
             lastVicious = monster
 

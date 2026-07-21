@@ -2,9 +2,9 @@
 
 Vic Hop / Vichop coordinates Bee Swarm Simulator searcher accounts and one killer through Firebase Realtime Database.
 
-- `searcher_support.lua` uses normal Roblox public matchmaking, validates and reserves the arrived server, watches `Workspace.Monsters`, and publishes a queue job only after it sees a live Vicious Bee with a living Humanoid.
+- `searcher_support.lua` prepares and reserves a different public server while scanning, joins that exact `JobId`, watches `Workspace.Monsters`, and publishes a queue job only after it sees a live Vicious Bee with a living Humanoid.
 - `killer_support.lua` atomically claims fresh jobs, joins the exact `JobId`, confirms a live Vicious Bee and its death, settles the stinger reward, and updates the local tracker.
-- Searchers never request or select destination `JobId` values. Active reservations, per-searcher history, and fleet history resolve matchmaking collisions after arrival and reduce short server cycles.
+- Searchers consume a fleet-wide Firebase candidate pool. One short-lived refill lease limits Roblox server-list discovery, while ETag reservations prevent searchers from preparing the same destination.
 
 ## Loaders
 
@@ -27,8 +27,6 @@ end
 ```
 
 There is no second shared loader or role file. The support scripts themselves wait for the local character, Humanoid, and HumanoidRootPart, then allow a two-second settle window before starting Vichop. They do not use `queue_on_teleport`. Searcher and killer scripts save a small non-secret, per-account resume file before teleporting because some executors do not preserve Roblox `TeleportData`. A per-server runtime guard prevents accidental duplicate starts.
-
-For the currently tested searcher account, the Opiumware loader is `/Users/andy/Opiumware/autoexec/vichop-searcher.lua`.
 
 ## Optional configuration
 
@@ -69,25 +67,35 @@ Data is stored under these paths:
 /activeServers/<JobId>                searcher reservation and heartbeat
 /recentServers/<searcherId>/<JobId>   per-searcher visit timestamp
 /fleetRecent/<JobId>                  most recent fleet visit
+/candidatePool/<JobId>                cached public destination metadata
+/candidatePoolMeta/refillLease        fleet-wide discovery lease
+/candidatePoolMeta/cooldownUntil      shared Roblox rate-limit cooldown
+/candidatePoolMeta/nextCursor         next server-list page cursor
 ```
 
-An active reservation contains `searcherId`, `claimedAt`, `heartbeatAt`, and `placeId`. Searchers refresh it every 5 seconds; a heartbeat older than 20 seconds is abandoned and can be replaced. Per-searcher history is retained for 10 minutes, and fleet history receives a strong selection penalty for 45 seconds.
+An active reservation contains `searcherId`, `claimedAt`, `heartbeatAt`, and `placeId`. Searchers refresh current and prepared reservations every 3 seconds; a heartbeat older than 20 seconds is abandoned and can be replaced. Per-searcher history is retained for 10 minutes, and fleet history excludes a server for 45 seconds.
 
 Reservations and killer claims use Firebase REST ETags with `if-match`. This compare-and-swap operation prevents two clients from winning the same reservation or queue claim after reading the same old value. If an executor does not expose Firebase's `ETag` response header, the script refuses the unsafe claim instead of falling back to read-then-write.
 
 ## Searcher matchmaking
 
-The default and only searcher hop path calls:
+The searcher prepares a different destination during the five-second scan. Its only normal hop call is:
 
 ```lua
-TeleportService:Teleport(game.PlaceId)
+TeleportService:TeleportToPlaceInstance(
+    game.PlaceId,
+    preparedJobId,
+    Players.LocalPlayer
+)
 ```
 
-No player, teleport payload, or destination `ServerInstanceId` is supplied, so Roblox public matchmaking selects the server through the simplest executor-compatible overload. Searchers do not call the Roblox public-server REST endpoint and do not use candidate pools, page cursors, proxies, cookies, or rate-limit workarounds. A `429` from server-list discovery therefore cannot block normal searcher hopping.
+`preparedJobId` is atomically reserved and must differ from the current and previous JobIds. Generic same-place matchmaking is disabled because it can return the same server. The Roblox public-server endpoint is used only by the background fleet refiller, never by the teleport controller.
 
-The local resume file carries the previous `JobId`, stable searcher ID, and repeated-rehop count. After arrival, the script rejects the server immediately when matchmaking returned the previous `JobId`, the account or fleet checked it recently, Firebase history is unavailable, or another active searcher wins its ETag reservation. Only a valid reservation starts the normal five-second Vicious scan and heartbeat.
+Only one searcher may hold the refill lease. Its cursor and `Retry-After` cooldown are shared in Firebase, so other searchers consume cached candidates without hitting Roblox. Candidates expire after three minutes, full servers are rejected, consumed candidates are removed, and the pool is capped at 120 entries.
 
-The no-Vicious critical path stops reservation work, saves the resume context locally, and calls generic matchmaking. An owned reservation is released synchronously so executor HTTP cannot remain in flight during the Roblox transition; the console reports the resulting decision-to-teleport-call latency. Initial cleanup is deferred, and invalid arrivals do not issue an unnecessary release request. Teleport initialization failures use one persistent controller with capped short backoff; it never gives up after a fixed retry count. A small randomized delay applies only after three consecutive invalid arrivals, reducing repeated matchmaking collisions without slowing normal hops.
+The resume file carries the previous and expected JobIds, candidate source, preparation state, and decision-to-call latency. Arrival is valid only when the actual JobId differs from the previous one and matches the expected one. Ownership is then revalidated before the server is marked visited.
+
+At the no-Vicious decision, the controller freezes new background work and drains anything already in flight before saving the resume file and teleporting. It does not discover, sort, reserve, clean up, fetch GitHub, or release the old current reservation in that transition phase. The old reservation expires naturally. If no destination is prepared, one controller enters `WAITING_FOR_DESTINATION`, logs once, and teleports as soon as preparation finishes. It never falls back to generic matchmaking and never permanently gives up.
 
 The killer remains different by design: it must claim and explicitly join the exact `JobId` containing the detected Vicious Bee.
 
@@ -131,7 +139,7 @@ The Discord outcome uses inline Reward, Session, Lifetime, and Server fields. We
 
 ## Executor compatibility
 
-- An executor HTTP request function (`request`, `http_request`, or `syn.request`) is required for Firebase coordination. Searcher matchmaking itself does not use HTTP discovery.
+- An executor HTTP request function (`request`, `http_request`, or `syn.request`) is required for Firebase coordination and background candidate discovery.
 - Executor autoexecute is required for continuous hopping; `queue_on_teleport` is not used.
 - `Drawing` is optional; its absence disables only the visual tracker.
 - Local file APIs preserve searcher resume context and provide a fallback when killer `TeleportData` is dropped. Without them, same-server comparison and killer claim resume are unavailable. Their absence also disables persistent lifetime statistics.
