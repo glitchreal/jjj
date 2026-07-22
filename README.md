@@ -76,6 +76,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
+getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
 if game.PlaceId == 1537690962 then
     local url = "https://raw.githubusercontent.com/glitchreal/jjj/main/killer_support.lua"
     local cacheFile = "vichop_killer_source.lua"
