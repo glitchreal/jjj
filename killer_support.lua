@@ -40,8 +40,10 @@ local ACTIVE_SEARCHER_REFRESH_SECONDS = 10
 local ACTIVE_SEARCHER_STALE_SECONDS = 45
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
-local HIVE_CLAIM_TIMEOUT_SECONDS = 3
+local HIVE_CLAIM_TIMEOUT_SECONDS = 8
 local HIVE_CLAIM_RETRY_SECONDS = 0.35
+local HIVE_CLAIM_MAX_ATTEMPTS = 5
+local HIVE_CLAIM_VERIFY_SECONDS = 1.5
 local DEFAULT_HIVE_APPROACH_SPEED = 55
 local MIN_HIVE_APPROACH_SPEED = 25
 local MAX_HIVE_APPROACH_SPEED = 90
@@ -776,28 +778,43 @@ local function claimAvailableHive()
         return true
     end
 
-    local claimRemote = ReplicatedStorage:FindFirstChild("Events")
-    claimRemote = claimRemote and claimRemote:FindFirstChild("ClaimHive")
-    if not claimRemote or not claimRemote:IsA("RemoteEvent") then
+    local claimRemote
+    local remoteDeadline = os.clock() + HIVE_CLAIM_TIMEOUT_SECONDS
+    while runtime.active and not runtime.teleportStarted and os.clock() < remoteDeadline do
+        local events = ReplicatedStorage:FindFirstChild("Events")
+        local candidate = events and events:FindFirstChild("ClaimHive")
+        if candidate and candidate:IsA("RemoteEvent") then
+            claimRemote = candidate
+            break
+        end
+        task.wait(0.15)
+    end
+    if not claimRemote then
         warn("[Vichop/Killer] ClaimHive remote is unavailable")
         return false
     end
 
-    local deadline = os.clock() + HIVE_CLAIM_TIMEOUT_SECONDS
-    while runtime.active and not runtime.teleportStarted and os.clock() < deadline do
+    local deadline = os.clock() + HIVE_CLAIM_TIMEOUT_SECONDS + HIVE_CLAIM_VERIFY_SECONDS
+    local attempt = 0
+    while runtime.active and not runtime.teleportStarted and os.clock() < deadline
+        and attempt < HIVE_CLAIM_MAX_ATTEMPTS do
         local _, _, root = getCharacterParts()
         if not root then
-            return false
+            task.wait(HIVE_CLAIM_RETRY_SECONDS)
+            continue
         end
         local platform, hive, platformPart = findNearestEmptyHivePlatform(root)
         if not platform then
-            warn("[Vichop/Killer] No unoccupied hive is available")
-            return false
+            warn("[Vichop/Killer] No unoccupied hive snapshot; rescanning")
+            task.wait(HIVE_CLAIM_RETRY_SECONDS)
+            continue
         end
+        attempt = attempt + 1
 
         if not tweenToHivePlatform(platform, platformPart) then
-            warn("[Vichop/Killer] Could not reach", hive.Name, "before claiming")
-            return false
+            warn("[Vichop/Killer] Could not reach", hive.Name, "on claim attempt", attempt)
+            task.wait(HIVE_CLAIM_RETRY_SECONDS)
+            continue
         end
 
         local playerRef, currentHive = getPlatformData(platform)
@@ -809,10 +826,14 @@ local function claimAvailableHive()
                 if not fired then
                     warn("[Vichop/Killer] ClaimHive request failed:", tostring(fireError))
                 end
+            else
+                warn("[Vichop/Killer] HiveID was unavailable; rescanning")
             end
+        else
+            warn("[Vichop/Killer] Hive became occupied before claim; rescanning")
         end
 
-        local verifyDeadline = math.min(deadline, os.clock() + 1.1)
+        local verifyDeadline = math.min(deadline, os.clock() + HIVE_CLAIM_VERIFY_SECONDS)
         while runtime.active and os.clock() < verifyDeadline do
             local claimedPlatform, claimedHive = findOwnedHivePlatform()
             if claimedPlatform then
@@ -823,6 +844,7 @@ local function claimAvailableHive()
             end
             task.wait(0.1)
         end
+        print("[Vichop/Killer] Hive claim not confirmed on attempt", attempt, "; retrying")
         task.wait(HIVE_CLAIM_RETRY_SECONDS)
     end
     warn("[Vichop/Killer] Hive claim was not confirmed; continuing to the Vicious target")
