@@ -153,6 +153,28 @@ getgenv().VICHOP_SEARCHER_ID = "searcher-west-01"
 
 Use a distinct value for every simultaneously running searcher.
 
+## Searcher anti-lag
+
+Searcher anti-lag is enabled in `aggressive` mode by default. Set overrides before running the searcher loader:
+
+```lua
+getgenv().VICHOP_ANTILAG_ENABLED = true
+getgenv().VICHOP_ANTILAG_MODE = "aggressive"
+-- Use the full retrying searcher loader above after setting these values.
+```
+
+Available modes:
+
+- `off` makes no rendering changes. Setting `VICHOP_ANTILAG_ENABLED` to `false` also selects this mode.
+- `safe` disables effects, sounds, lights, post-processing, shadows, decals, and textures through normal instance properties. It does not destroy map objects.
+- `aggressive` is the default for dedicated searchers. In addition to safe rendering changes, it destroys class-identified visual and audio effects and locally hides unprotected map parts. It does not destroy parts, meshes, models, folders, or top-level Workspace containers.
+
+Both active modes lower rendering quality, disable global shadows, and reduce Terrain water effects when Roblox allows those property changes. Initial work starts only after the character readiness checks and a bounded wait for `Workspace.Monsters`. The first Vicious scan runs before cleanup, and cleanup is yielded in batches. One guarded `DescendantAdded` connection handles later effects without creating per-instance listeners. A compact health line is printed on hop 1 and every 10 hops.
+
+The preserve rules leave `Workspace.Monsters` and everything beneath it untouched, including Vicious models, `MonsterType`, Humanoid, and level data. They also protect the local character, HumanoidRootPart, current Camera, Terrain itself, Roblox services, and instances with uncertain ancestry. The anti-lag path requires no Drawing API, hidden-property changes, hooks, debug APIs, or filesystem APIs. Filesystem support remains optional for the searcher's existing cross-teleport resume context.
+
+Aggressive mode intentionally makes most of the map invisible and removes client-side sound and effects. Use it only on dedicated searcher accounts; use `safe` while troubleshooting executor or game-update compatibility. Killer visuals, tracker, stinger counting, and webhook behavior are unchanged.
+
 ## Firebase data
 
 The database URL remains:
