@@ -224,6 +224,18 @@ Destination preparation uses a generation guard and a 45-second watchdog. If a F
 
 The killer remains different by design: it must claim and explicitly join the exact `JobId` containing the detected Vicious Bee.
 
+## Killer hive and combat movement
+
+The killer claims a hive after its character finishes loading. It inspects `Workspace.HivePlatforms`, follows each platform's `Hive` ObjectValue to the corresponding `Workspace.Honeycombs` model, and treats a platform as available only when both `PlayerRef` and the Honeycomb's `Owner` are empty and its phase is `Idle`. The character Tweens to the nearest available platform, occupancy is checked again, and then `ReplicatedStorage.Events.ClaimHive` is fired with that Honeycomb's `HiveID`. Claim verification is bounded so a missing or contested hive cannot prevent the killer from handling a Vicious job.
+
+After a claimed server is validated and a living Vicious Bee is confirmed, the killer creates one `AlignPosition` and one `AlignOrientation` on HumanoidRootPart. Travel uses temporary noclip and continually follows the monster's HumanoidRootPart. At combat range, the constraints and noclip are disabled and the Humanoid walks around the target at about five studs. If the Vicious Bee moves more than 14 studs away, AlignPosition travel resumes.
+
+Live inspection found the Vicious definition at `ReplicatedStorage.MonsterTypes.Vicious Bee`, with a 4.5-stud attack radius, three-second aiming period, and four-second attack delay. A live level-six fight confirmed that attacks create paired, top-level `Workspace.Particles.Thorn` and `Workspace.Particles.WarningDisk` parts at matching horizontal positions. The Thorn is anchored, non-collidable, initially transparent, approximately `2.44 x 22.32 x 2.44`, and uses mesh `1033714`; its warning disk is anchored, non-collidable, approximately `10 x 0.4 x 10`, and supplies the five-stud visual danger radius. Cosmetic Thorn parts under `Workspace.Particles.Vicious` belong to the Bee's visual body and are explicitly excluded.
+
+While hunting, one guarded `Workspace.DescendantAdded` listener prioritizes those exact top-level attack objects and retains combined ancestry, recent-creation, proximity, and geometry checks as a compatibility fallback. A 6.5-stud avoidance radius adds margin around the observed five-stud disk. Travel paths are deflected around tracked hazards, and combat orbit candidates are scored away from them. The exact warning-to-damage lifetime was not measured before the observed Vicious died, so hazards remain tracked for a conservative five-second window.
+
+The movement controller disconnects its listeners, destroys its constraints and attachment, restores every modified collision value and Humanoid AutoRotate state, and stops walking when the target dies or disappears, the claim is lost, teleport starts, the runtime is replaced, or the script exits. Spike geometry and timing remain a compatibility risk after Bee Swarm updates; a captured live fight would allow the anonymous marker classifier and danger radius to be calibrated more precisely.
+
 Job states:
 
 - `spawned`: a searcher currently sees a live Vicious Bee.

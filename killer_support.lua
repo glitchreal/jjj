@@ -4,8 +4,10 @@
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local TeleportService = game:GetService("TeleportService")
 local StarterGui = game:GetService("StarterGui")
+local TweenService = game:GetService("TweenService")
 
 local BSS_PLACE_ID = 1537690962
 local DATABASE_URL = "https://vichop-coordination-2026-default-rtdb.firebaseio.com"
@@ -33,6 +35,19 @@ local ACTIVE_SEARCHER_REFRESH_SECONDS = 10
 local ACTIVE_SEARCHER_STALE_SECONDS = 45
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
+local HIVE_CLAIM_TIMEOUT_SECONDS = 3
+local HIVE_CLAIM_RETRY_SECONDS = 0.35
+local HIVE_APPROACH_SPEED = 90
+local HIVE_APPROACH_MAX_SECONDS = 2.5
+local TRAVEL_MAX_VELOCITY = 145
+local TRAVEL_RESPONSIVENESS = 65
+local TRAVEL_REACHED_DISTANCE = 7
+local TRAVEL_REENTER_DISTANCE = 14
+local COMBAT_DISTANCE = 5
+local COMBAT_ORBIT_SPEED = 1.65
+local COMBAT_MOVE_INTERVAL = 0.12
+local SPIKE_TRACK_SECONDS = 5
+local SPIKE_DANGER_RADIUS = 6.5
 
 if game.PlaceId ~= BSS_PLACE_ID then
     return
@@ -111,6 +126,9 @@ if type(previousRuntime) == "table" and previousRuntime.active and previousRunti
     print("[Vichop/Killer] Already running in this server")
     return
 end
+if type(previousRuntime) == "table" and type(previousRuntime.stopMovement) == "function" then
+    pcall(previousRuntime.stopMovement, "runtime_replaced")
+end
 
 local sessionId = joinTeleportData.vichopRole == "killer" and joinTeleportData.vichopSessionId
     or env.__VICHOP_KILLER_SESSION_ID
@@ -140,6 +158,8 @@ local runtime = {
     activeSearcherCount = nil,
     activeSearcherCountAt = 0,
     activeSearcherRefreshRunning = false,
+    hiveClaimed = false,
+    hiveName = nil,
 }
 env.__VICHOP_KILLER_RUNTIME = runtime
 
@@ -537,6 +557,519 @@ local function getVicious()
         end
     end
     return nil, nil, nil
+end
+
+local function getCharacterParts()
+    local currentCharacter = PLAYER.Character
+    local humanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+    local root = currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
+    if not currentCharacter or not humanoid or not root or humanoid.Health <= 0 then
+        return nil, nil, nil
+    end
+    return currentCharacter, humanoid, root
+end
+
+local function getPlatformData(platform)
+    if not platform or not platform:IsA("Model") then
+        return nil, nil, nil
+    end
+    local playerRef = platform:FindFirstChild("PlayerRef")
+    local hiveRef = platform:FindFirstChild("Hive")
+    local hive = hiveRef and hiveRef.Value
+    local platformPart = platform:FindFirstChild("Platform")
+    if not playerRef or not hive or not hive:IsA("Model") or not platformPart or not platformPart:IsA("BasePart") then
+        return nil, nil, nil
+    end
+    return playerRef, hive, platformPart
+end
+
+local function findOwnedHivePlatform()
+    local platforms = workspace:FindFirstChild("HivePlatforms")
+    if not platforms then
+        return nil, nil
+    end
+    for _, platform in ipairs(platforms:GetChildren()) do
+        local playerRef, hive = getPlatformData(platform)
+        local owner = hive and hive:FindFirstChild("Owner")
+        if playerRef and (playerRef.Value == PLAYER or (owner and owner.Value == PLAYER)) then
+            return platform, hive
+        end
+    end
+    return nil, nil
+end
+
+local function findNearestEmptyHivePlatform(root)
+    local platforms = workspace:FindFirstChild("HivePlatforms")
+    if not platforms then
+        return nil, nil, nil
+    end
+    local bestPlatform, bestHive, bestPart, bestDistance
+    for _, platform in ipairs(platforms:GetChildren()) do
+        local playerRef, hive, platformPart = getPlatformData(platform)
+        local owner = hive and hive:FindFirstChild("Owner")
+        local phase = hive and hive:FindFirstChild("Phase")
+        local unoccupied = playerRef and playerRef.Value == nil and (not owner or owner.Value == nil)
+            and (not phase or phase.Value == "Idle")
+        if unoccupied then
+            local distance = (root.Position - platformPart.Position).Magnitude
+            if not bestDistance or distance < bestDistance then
+                bestPlatform, bestHive, bestPart, bestDistance = platform, hive, platformPart, distance
+            end
+        end
+    end
+    return bestPlatform, bestHive, bestPart
+end
+
+local function tweenToHivePlatform(platform, platformPart)
+    local currentCharacter, humanoid, root = getCharacterParts()
+    if not currentCharacter or not platform or not platformPart then
+        return false
+    end
+    local originalCollisions = {}
+    for _, descendant in ipairs(currentCharacter:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            originalCollisions[descendant] = descendant.CanCollide
+            descendant.CanCollide = false
+        end
+    end
+
+    local target = platformPart.CFrame * CFrame.new(0, 3.25, 0)
+    local duration = math.clamp((root.Position - target.Position).Magnitude / HIVE_APPROACH_SPEED, 0.15, HIVE_APPROACH_MAX_SECONDS)
+    local tweenOk, tween = pcall(
+        TweenService.Create,
+        TweenService,
+        root,
+        TweenInfo.new(duration, Enum.EasingStyle.Linear),
+        { CFrame = target }
+    )
+    if not tweenOk or not tween then
+        for part, canCollide in pairs(originalCollisions) do
+            if part.Parent then
+                part.CanCollide = canCollide
+            end
+        end
+        return false
+    end
+    local finished = false
+    local completedConnection = tween.Completed:Connect(function(playbackState)
+        finished = playbackState == Enum.PlaybackState.Completed
+    end)
+    local playOk = pcall(tween.Play, tween)
+    if not playOk then
+        completedConnection:Disconnect()
+        for part, canCollide in pairs(originalCollisions) do
+            if part.Parent then
+                part.CanCollide = canCollide
+            end
+        end
+        return false
+    end
+    local deadline = os.clock() + duration + 0.75
+    while runtime.active and not runtime.teleportStarted and not finished and os.clock() < deadline do
+        task.wait()
+    end
+    if not finished then
+        tween:Cancel()
+    end
+    completedConnection:Disconnect()
+    for part, canCollide in pairs(originalCollisions) do
+        if part.Parent then
+            part.CanCollide = canCollide
+        end
+    end
+    humanoid.AutoRotate = true
+    return finished and (root.Position - target.Position).Magnitude <= 7
+end
+
+local function claimAvailableHive()
+    local ownedPlatform, ownedHive = findOwnedHivePlatform()
+    if ownedPlatform then
+        runtime.hiveClaimed = true
+        runtime.hiveName = ownedHive.Name
+        return true
+    end
+
+    local claimRemote = ReplicatedStorage:FindFirstChild("Events")
+    claimRemote = claimRemote and claimRemote:FindFirstChild("ClaimHive")
+    if not claimRemote or not claimRemote:IsA("RemoteEvent") then
+        warn("[Vichop/Killer] ClaimHive remote is unavailable")
+        return false
+    end
+
+    local deadline = os.clock() + HIVE_CLAIM_TIMEOUT_SECONDS
+    while runtime.active and not runtime.teleportStarted and os.clock() < deadline do
+        local _, _, root = getCharacterParts()
+        if not root then
+            return false
+        end
+        local platform, hive, platformPart = findNearestEmptyHivePlatform(root)
+        if not platform then
+            warn("[Vichop/Killer] No unoccupied hive is available")
+            return false
+        end
+
+        if not tweenToHivePlatform(platform, platformPart) then
+            warn("[Vichop/Killer] Could not reach", hive.Name, "before claiming")
+            return false
+        end
+
+        local playerRef, currentHive = getPlatformData(platform)
+        local owner = currentHive and currentHive:FindFirstChild("Owner")
+        if playerRef and playerRef.Value == nil and (not owner or owner.Value == nil) then
+            local hiveId = currentHive:FindFirstChild("HiveID")
+            if hiveId then
+                local fired, fireError = pcall(claimRemote.FireServer, claimRemote, hiveId.Value)
+                if not fired then
+                    warn("[Vichop/Killer] ClaimHive request failed:", tostring(fireError))
+                end
+            end
+        end
+
+        local verifyDeadline = math.min(deadline, os.clock() + 1.1)
+        while runtime.active and os.clock() < verifyDeadline do
+            local claimedPlatform, claimedHive = findOwnedHivePlatform()
+            if claimedPlatform then
+                runtime.hiveClaimed = true
+                runtime.hiveName = claimedHive.Name
+                print("[Vichop/Killer] Claimed", claimedHive.Name)
+                return true
+            end
+            task.wait(0.1)
+        end
+        task.wait(HIVE_CLAIM_RETRY_SECONDS)
+    end
+    warn("[Vichop/Killer] Hive claim was not confirmed; continuing to the Vicious target")
+    return false
+end
+
+local movement = {
+    active = false,
+    mode = "idle",
+    target = nil,
+    attachment = nil,
+    alignPosition = nil,
+    alignOrientation = nil,
+    updateConnection = nil,
+    hazardConnection = nil,
+    noclipConnection = nil,
+    orbitAngle = 0,
+    lastCombatMoveAt = 0,
+    originalAutoRotate = nil,
+    originalCollisions = {},
+    hazards = setmetatable({}, { __mode = "k" }),
+}
+
+local function getMonsterRoot(monster)
+    if not monster or not monster.Parent then
+        return nil
+    end
+    return monster:FindFirstChild("HumanoidRootPart") or monster.PrimaryPart
+        or monster:FindFirstChild("Torso") or monster:FindFirstChild("Head")
+end
+
+local function disableTravelNoclip()
+    if movement.noclipConnection then
+        movement.noclipConnection:Disconnect()
+        movement.noclipConnection = nil
+    end
+    for part, canCollide in pairs(movement.originalCollisions) do
+        if part.Parent then
+            part.CanCollide = canCollide
+        end
+    end
+    table.clear(movement.originalCollisions)
+end
+
+local function enableTravelNoclip(currentCharacter)
+    disableTravelNoclip()
+    local function apply()
+        if not movement.active or movement.mode ~= "travel" or PLAYER.Character ~= currentCharacter then
+            return
+        end
+        for _, descendant in ipairs(currentCharacter:GetDescendants()) do
+            if descendant:IsA("BasePart") then
+                if movement.originalCollisions[descendant] == nil then
+                    movement.originalCollisions[descendant] = descendant.CanCollide
+                end
+                descendant.CanCollide = false
+            end
+        end
+    end
+    apply()
+    movement.noclipConnection = RunService.Stepped:Connect(apply)
+end
+
+local function isSpikeName(instance)
+    local cursor = instance
+    for _ = 1, 3 do
+        if not cursor then
+            break
+        end
+        local name = string.lower(cursor.Name)
+        if string.find(name, "spike", 1, true) or string.find(name, "stinger", 1, true)
+            or string.find(name, "thorn", 1, true) then
+            return true
+        end
+        cursor = cursor.Parent
+    end
+    return false
+end
+
+local function observeSpikeCandidate(instance)
+    if not movement.active or not instance:IsA("BasePart") then
+        return
+    end
+    local currentCharacter, _, root = getCharacterParts()
+    if not currentCharacter or instance:IsDescendantOf(currentCharacter)
+        or (movement.target and instance:IsDescendantOf(movement.target)) then
+        return
+    end
+    local particles = workspace:FindFirstChild("Particles")
+    local inParticles = particles and instance:IsDescendantOf(particles)
+    local viciousVisual = particles and particles:FindFirstChild("Vicious")
+    if viciousVisual and (instance == viciousVisual or instance:IsDescendantOf(viciousVisual)) then
+        return
+    end
+    local lowerName = string.lower(instance.Name)
+    local exactAttackSignal = instance.Parent == particles
+        and (lowerName == "thorn" or lowerName == "warningdisk")
+    local nameSignal = isSpikeName(instance)
+    local distance = (instance.Position - root.Position).Magnitude
+    local size = instance.Size
+    local pointedOrWarningShape = size.Y >= math.max(size.X, size.Z) * 1.25
+        or (size.Y <= 0.75 and math.max(size.X, size.Z) >= 1.5)
+        or instance:IsA("MeshPart") or instance:FindFirstChildOfClass("SpecialMesh") ~= nil
+    local hasAlignMover = instance:FindFirstChildWhichIsA("AlignPosition", true) ~= nil
+    local anonymousParticleSignal = inParticles and distance <= 20 and not instance.CanCollide
+        and pointedOrWarningShape and (instance.Anchored or not hasAlignMover)
+    if exactAttackSignal or nameSignal or anonymousParticleSignal then
+        movement.hazards[instance] = {
+            observedAt = os.clock(),
+            dangerRadius = exactAttackSignal and SPIKE_DANGER_RADIUS
+                or (nameSignal and SPIKE_DANGER_RADIUS or SPIKE_DANGER_RADIUS - 1),
+        }
+    end
+end
+
+local function activeSpikeHazards()
+    local result = {}
+    local timestamp = os.clock()
+    for instance, data in pairs(movement.hazards) do
+        if not instance.Parent or timestamp - data.observedAt > SPIKE_TRACK_SECONDS then
+            movement.hazards[instance] = nil
+        else
+            table.insert(result, { position = instance.Position, radius = data.dangerRadius })
+        end
+    end
+    return result
+end
+
+local function groundPosition(position, currentCharacter, monster)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { currentCharacter, monster }
+    local hit = workspace:Raycast(position + Vector3.new(0, 16, 0), Vector3.new(0, -48, 0), params)
+    if not hit then
+        return position
+    end
+    local _, humanoid, root = getCharacterParts()
+    local height = humanoid and root and humanoid.HipHeight + root.Size.Y * 0.5 or 3
+    return Vector3.new(position.X, hit.Position.Y + height, position.Z)
+end
+
+local function chooseCombatPosition(targetPosition, currentCharacter, monster, deltaTime)
+    movement.orbitAngle = movement.orbitAngle + COMBAT_ORBIT_SPEED * deltaTime
+    local hazards = activeSpikeHazards()
+    local bestPosition, bestScore
+    for index = 0, 11 do
+        local angle = movement.orbitAngle + index * math.pi / 6
+        local candidate = targetPosition + Vector3.new(math.cos(angle) * COMBAT_DISTANCE, 0, math.sin(angle) * COMBAT_DISTANCE)
+        local score = 100
+        for _, hazard in ipairs(hazards) do
+            local flatDistance = (Vector3.new(candidate.X, 0, candidate.Z)
+                - Vector3.new(hazard.position.X, 0, hazard.position.Z)).Magnitude
+            score = math.min(score, flatDistance - hazard.radius)
+        end
+        score = score - index * 0.08
+        if not bestScore or score > bestScore then
+            bestPosition, bestScore = candidate, score
+        end
+    end
+    return groundPosition(bestPosition, currentCharacter, monster)
+end
+
+local function distanceToSegment2d(point, startPoint, endPoint)
+    local point2d = Vector2.new(point.X, point.Z)
+    local start2d = Vector2.new(startPoint.X, startPoint.Z)
+    local end2d = Vector2.new(endPoint.X, endPoint.Z)
+    local segment = end2d - start2d
+    if segment.Magnitude < 0.01 then
+        return (point2d - start2d).Magnitude
+    end
+    local alpha = math.clamp((point2d - start2d):Dot(segment) / segment:Dot(segment), 0, 1)
+    return (point2d - (start2d + segment * alpha)).Magnitude
+end
+
+local function deflectTravelGoal(goal, currentPosition)
+    for _, hazard in ipairs(activeSpikeHazards()) do
+        if distanceToSegment2d(hazard.position, currentPosition, goal) <= hazard.radius then
+            local away = Vector3.new(goal.X - hazard.position.X, 0, goal.Z - hazard.position.Z)
+            if away.Magnitude < 0.1 then
+                local path = Vector3.new(goal.X - currentPosition.X, 0, goal.Z - currentPosition.Z)
+                away = path.Magnitude > 0.1 and Vector3.new(-path.Z, 0, path.X) or Vector3.new(1, 0, 0)
+            end
+            goal = goal + away.Unit * (hazard.radius + 3)
+        end
+    end
+    return goal
+end
+
+local function stopMovement(reason)
+    movement.active = false
+    movement.mode = "idle"
+    movement.target = nil
+    disableTravelNoclip()
+    for _, connectionName in ipairs({ "updateConnection", "hazardConnection" }) do
+        local connection = movement[connectionName]
+        movement[connectionName] = nil
+        if connection then
+            connection:Disconnect()
+        end
+    end
+    for _, instanceName in ipairs({ "alignPosition", "alignOrientation", "attachment" }) do
+        local instance = movement[instanceName]
+        movement[instanceName] = nil
+        if instance then
+            instance:Destroy()
+        end
+    end
+    local _, humanoid = getCharacterParts()
+    if humanoid then
+        humanoid:Move(Vector3.zero)
+        if movement.originalAutoRotate ~= nil then
+            humanoid.AutoRotate = movement.originalAutoRotate
+        end
+    end
+    movement.originalAutoRotate = nil
+    table.clear(movement.hazards)
+    if reason then
+        runtime.movementStopReason = reason
+    end
+end
+runtime.stopMovement = stopMovement
+
+local function enterTravelMode(currentCharacter, humanoid)
+    movement.mode = "travel"
+    humanoid.AutoRotate = false
+    movement.alignPosition.Enabled = true
+    movement.alignOrientation.Enabled = true
+    enableTravelNoclip(currentCharacter)
+end
+
+local function enterCombatMode(humanoid)
+    movement.mode = "combat"
+    movement.alignPosition.Enabled = false
+    movement.alignOrientation.Enabled = false
+    disableTravelNoclip()
+    humanoid.AutoRotate = true
+    movement.lastCombatMoveAt = 0
+end
+
+local function startMovement(monster)
+    stopMovement()
+    local currentCharacter, humanoid, root = getCharacterParts()
+    local monsterRoot = getMonsterRoot(monster)
+    if not currentCharacter or not monsterRoot then
+        return false
+    end
+
+    movement.active = true
+    movement.target = monster
+    movement.orbitAngle = math.atan2(root.Position.Z - monsterRoot.Position.Z, root.Position.X - monsterRoot.Position.X)
+    movement.originalAutoRotate = humanoid.AutoRotate
+
+    local attachment = Instance.new("Attachment")
+    attachment.Name = "VichopMovementAttachment"
+    attachment.Parent = root
+    movement.attachment = attachment
+
+    local alignPosition = Instance.new("AlignPosition")
+    alignPosition.Name = "VichopTravelPosition"
+    alignPosition.Mode = Enum.PositionAlignmentMode.OneAttachment
+    alignPosition.Attachment0 = attachment
+    alignPosition.ApplyAtCenterOfMass = true
+    alignPosition.MaxForce = 1000000
+    alignPosition.MaxVelocity = TRAVEL_MAX_VELOCITY
+    alignPosition.Responsiveness = TRAVEL_RESPONSIVENESS
+    alignPosition.RigidityEnabled = false
+    alignPosition.Parent = root
+    movement.alignPosition = alignPosition
+
+    local alignOrientation = Instance.new("AlignOrientation")
+    alignOrientation.Name = "VichopTravelOrientation"
+    alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+    alignOrientation.Attachment0 = attachment
+    alignOrientation.MaxTorque = 1000000
+    alignOrientation.Responsiveness = 45
+    alignOrientation.RigidityEnabled = false
+    alignOrientation.Parent = root
+    movement.alignOrientation = alignOrientation
+
+    enterTravelMode(currentCharacter, humanoid)
+    local particles = workspace:FindFirstChild("Particles")
+    if particles then
+        for _, instance in ipairs(particles:GetDescendants()) do
+            observeSpikeCandidate(instance)
+        end
+    end
+    movement.hazardConnection = workspace.DescendantAdded:Connect(observeSpikeCandidate)
+    movement.updateConnection = RunService.Heartbeat:Connect(function(deltaTime)
+        if not movement.active or not runtime.active or runtime.teleportStarted then
+            stopMovement(runtime.teleportStarted and "teleport" or "runtime_stopped")
+            return
+        end
+        local activeCharacter, activeHumanoid, activeRoot = getCharacterParts()
+        local activeMonsterRoot = getMonsterRoot(monster)
+        local monsterHumanoid = monster and monster:FindFirstChildOfClass("Humanoid")
+        if not activeCharacter or not activeMonsterRoot or not monsterHumanoid or monsterHumanoid.Health <= 0 then
+            stopMovement("target_unavailable")
+            return
+        end
+
+        local targetPosition = activeMonsterRoot.Position
+        local flatDistance = (Vector3.new(activeRoot.Position.X, 0, activeRoot.Position.Z)
+            - Vector3.new(targetPosition.X, 0, targetPosition.Z)).Magnitude
+        if movement.mode == "travel" then
+            local direction = Vector3.new(activeRoot.Position.X - targetPosition.X, 0, activeRoot.Position.Z - targetPosition.Z)
+            if direction.Magnitude < 0.1 then
+                direction = Vector3.new(1, 0, 0)
+            else
+                direction = direction.Unit
+            end
+            local travelGoal = targetPosition + direction * COMBAT_DISTANCE
+            movement.alignPosition.Position = deflectTravelGoal(travelGoal, activeRoot.Position)
+            if (activeRoot.Position - targetPosition).Magnitude > 0.1 then
+                movement.alignOrientation.CFrame = CFrame.lookAt(activeRoot.Position, targetPosition)
+            end
+            if flatDistance <= TRAVEL_REACHED_DISTANCE then
+                enterCombatMode(activeHumanoid)
+            end
+        else
+            if flatDistance >= TRAVEL_REENTER_DISTANCE then
+                enterTravelMode(activeCharacter, activeHumanoid)
+                return
+            end
+            if os.clock() - movement.lastCombatMoveAt >= COMBAT_MOVE_INTERVAL then
+                local timestamp = os.clock()
+                local elapsed = movement.lastCombatMoveAt > 0 and timestamp - movement.lastCombatMoveAt
+                    or COMBAT_MOVE_INTERVAL
+                movement.lastCombatMoveAt = timestamp
+                activeHumanoid:MoveTo(chooseCombatPosition(targetPosition, activeCharacter, monster, elapsed))
+            end
+        end
+    end)
+    print("[Vichop/Killer] Moving to confirmed Vicious Bee with AlignPosition")
+    return true
 end
 
 local hud = {}
@@ -972,7 +1505,9 @@ local function handleClaim(key, job)
     job.viciousLevel = level or job.viciousLevel
     setState("HUNTING", "Live Vicious Bee confirmed")
     notify("Vichop arrived", "Live Vicious Bee confirmed in claimed server")
+    startMovement(monster)
     local confirmed, stingersBefore, failureReason = monitorConfirmedDeath(key, monster, humanoid)
+    stopMovement(confirmed and "vicious_defeated" or (failureReason or "hunt_ended"))
     if not confirmed then
         reportFailure(key, job, failureReason or "unconfirmed_disappearance", "Failure - unconfirmed death")
         runtime.currentClaimKey = nil
@@ -1178,6 +1713,7 @@ local playerTeleportConnection = PLAYER.OnTeleport:Connect(function(state)
     if state == Enum.TeleportState.Started then
         runtime.teleportStarted = true
         runtime.active = false
+        stopMovement("teleport")
     end
 end)
 
@@ -1282,6 +1818,9 @@ local function runKiller()
 
     print("[Vichop/Killer] Running", KILLER_NAME, "session", sessionId:sub(1, 18), "in", shortJobId(game.JobId))
 
+    setState("HIVE", "Claiming an unoccupied hive")
+    claimAvailableHive()
+
     local arrivalState = recoverArrivalContext()
     while runtime.active and arrivalState == "blocked" do
         task.wait(1)
@@ -1337,6 +1876,7 @@ end
 
 local runOk, runError = xpcall(runKiller, tracebackMessage)
 runtime.active = false
+stopMovement(runOk and "runtime_finished" or "runtime_error")
 if not runOk then
     warn("[Vichop/Killer] Main loop stopped and can be restarted:", tostring(runError))
 end
