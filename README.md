@@ -157,7 +157,7 @@ Use a distinct value for every simultaneously running searcher.
 The database URL remains:
 
 ```text
-https://bss-job-queue-7bf75-default-rtdb.firebaseio.com
+https://vichop-coordination-2026-default-rtdb.firebaseio.com
 ```
 
 Data is stored under these paths:
