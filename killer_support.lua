@@ -201,10 +201,10 @@ env.__VICHOP_KILLER_RUNTIME = runtime
 
 local KILLER_NAME = HIDE_KILLER_USER and "Hidden" or PLAYER.Name
 local DISCORD_WEBHOOK_URL = type(env.VICHOP_WEBHOOK_URL) == "string" and env.VICHOP_WEBHOOK_URL or ""
-local WEBHOOK_IMAGE_URL = type(env.VICHOP_WEBHOOK_IMAGE_URL) == "string" and env.VICHOP_WEBHOOK_IMAGE_URL
-    or "https://raw.githubusercontent.com/glitchreal/jjj/main/assets/vaporwave.png"
 local WEBHOOK_USERNAME = "Vichop Tracker"
 local WEBHOOK_AVATAR_URL = ""
+local HUD_BACKGROUND_URL = "https://raw.githubusercontent.com/glitchreal/jjj/main/assets/honey_workspace.jpg"
+local HUD_BACKGROUND_FILE = "vichop_honey_workspace.jpg"
 local httpRequest = request or http_request or (syn and syn.request)
 if type(httpRequest) ~= "function" then
     warn("[Vichop/Killer] Disabled: executor HTTP requests are unavailable")
@@ -1392,6 +1392,41 @@ end
 
 local hud = { connections = {}, values = {} }
 
+local function loadHudBackgroundAsset()
+    local customAsset = type(getcustomasset) == "function" and getcustomasset
+        or (type(getsynasset) == "function" and getsynasset or nil)
+    if not customAsset or type(writefile) ~= "function" then
+        return nil
+    end
+
+    local fileReady = false
+    if type(isfile) == "function" then
+        local ok, exists = pcall(isfile, HUD_BACKGROUND_FILE)
+        fileReady = ok and exists == true
+    elseif type(readfile) == "function" then
+        fileReady = pcall(readfile, HUD_BACKGROUND_FILE)
+    end
+
+    if not fileReady then
+        local ok, response = pcall(httpRequest, {
+            Url = HUD_BACKGROUND_URL,
+            Method = "GET",
+            Timeout = HTTP_TIMEOUT_SECONDS,
+        })
+        local body = ok and response and (response.Body or response.body) or nil
+        local status = ok and responseStatus(response) or 0
+        if status >= 200 and status < 300 and type(body) == "string" and #body > 1024 then
+            fileReady = pcall(writefile, HUD_BACKGROUND_FILE, body)
+        end
+    end
+
+    if not fileReady then
+        return nil
+    end
+    local ok, asset = pcall(customAsset, HUD_BACKGROUND_FILE)
+    return ok and asset or nil
+end
+
 local function trackHudConnection(connection)
     table.insert(hud.connections, connection)
     return connection
@@ -1489,6 +1524,7 @@ local function createHud()
     window.BackgroundColor3 = Color3.fromRGB(10, 13, 12)
     window.BackgroundTransparency = 0.04
     window.BorderSizePixel = 0
+    window.ClipsDescendants = true
     window.Parent = screenGui
     hud.window = window
 
@@ -1500,6 +1536,23 @@ local function createHud()
     windowStroke.Thickness = 1.5
     windowStroke.Transparency = 0.2
     windowStroke.Parent = window
+
+    local backgroundArtwork = Instance.new("ImageLabel")
+    backgroundArtwork.Name = "BackgroundArtwork"
+    backgroundArtwork.Size = UDim2.fromScale(1, 1)
+    backgroundArtwork.BackgroundTransparency = 1
+    backgroundArtwork.Image = ""
+    backgroundArtwork.ImageColor3 = Color3.fromRGB(110, 110, 110)
+    backgroundArtwork.ImageTransparency = 0.18
+    backgroundArtwork.ScaleType = Enum.ScaleType.Crop
+    backgroundArtwork.ZIndex = 1
+    backgroundArtwork.Parent = window
+    task.spawn(function()
+        local asset = loadHudBackgroundAsset()
+        if asset and backgroundArtwork.Parent then
+            backgroundArtwork.Image = asset
+        end
+    end)
 
     local header = Instance.new("Frame")
     header.Name = "Header"
@@ -1661,6 +1714,12 @@ local function createHud()
     sliderInput.ZIndex = 4
     sliderInput.Parent = sliderTrack
 
+    for _, descendant in ipairs(window:GetDescendants()) do
+        if descendant:IsA("GuiObject") and descendant ~= backgroundArtwork then
+            descendant.ZIndex = math.max(descendant.ZIndex, 2)
+        end
+    end
+
     local function renderSpeed()
         local alpha = (runtime.hiveTweenSpeed - MIN_HIVE_APPROACH_SPEED)
             / (MAX_HIVE_APPROACH_SPEED - MIN_HIVE_APPROACH_SPEED)
@@ -1804,7 +1863,6 @@ local function sendWebhook(report)
                 { name = "Total Kill", value = "`" .. formatNumber(stats.totalKills) .. "`", inline = true },
                 { name = "Total Stinger", value = "`" .. formatNumber(stats.totalStingers) .. "`", inline = true },
             },
-            image = WEBHOOK_IMAGE_URL ~= "" and { url = WEBHOOK_IMAGE_URL } or nil,
             footer = { text = "Vichop Tracker | " .. formatDuration(now() - stats.startedAt) .. " session uptime" },
         }},
     }

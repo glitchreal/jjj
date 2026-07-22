@@ -143,8 +143,6 @@ Configure the Discord webhook before the killer loadstring in its autoexecute fi
 getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
 getgenv().VICHOP_HIDE_KILLER_USER = true
 getgenv().VICHOP_HIVE_TWEEN_SPEED = 55 -- optional; clamped to 25-90
--- Optional: replace the repository-owned Vaporwave banner.
--- getgenv().VICHOP_WEBHOOK_IMAGE_URL = "https://example.com/banner.png"
 -- Use the full retrying killer loader above after setting the webhook.
 ```
 
@@ -280,11 +278,11 @@ If either side cannot be read, the job, tracker result, and Discord embed use `U
 
 ## Tracker and statistics
 
-The killer tracker is a centered native Roblox panel with a restrained black-and-neon theme, compact typography, and an animated green-to-black `Vichop Made By Qitch` title. Drag its header to reposition it. Its hive tween-speed slider ranges from 25 to 90 studs per second and defaults to 55; changes apply to the next hive approach and persist through the executor environment. It shows session kills and stingers, Total Kill, Total Stinger, stingers per hour, active searchers, current state, last result, and session uptime. Server ID and joined-server statistics are intentionally hidden.
+The killer tracker is a centered native Roblox panel using the repository-owned honey workspace artwork behind a dark readability tint, compact typography, and an animated green-to-black `Vichop Made By Qitch` title. The optimized artwork is downloaded once and cached with executor file APIs; clients without custom-asset support retain the dark fallback panel. Drag its header to reposition it. Its hive tween-speed slider ranges from 25 to 90 studs per second and defaults to 55; changes apply to the next hive approach and persist through the executor environment. It shows session kills and stingers, Total Kill, Total Stinger, stingers per hour, active searchers, current state, last result, and session uptime. Server ID and joined-server statistics are intentionally hidden.
 
 Lifetime and active-session values are stored in `vichop_stats.json`. The session ID is passed in teleport data and in the per-account local resume file, so session counters do not reset on every hop. Writes use a temporary file before replacing the main file. Invalid JSON is copied to a timestamped `.corrupt-*.json` backup when file APIs are available, then clean defaults are used.
 
-The Discord outcome keeps Reward, Inventory, Session, Total, and Fleet fields. Killer identity, server ID, search/hop time, joined-server count, and kill-server time are intentionally omitted. `Lifetime kills` and `Lifetime stingers` are presented as `Total Kill` and `Total Stinger`. The supplied Vaporwave artwork is displayed as the embed's large image; Discord does not support a custom image behind embed text. `Stingers / hour` is calculated from session stingers divided by persistent session uptime. `Active searchers` counts unique `searcherId` values whose `/activeServers` heartbeat is no older than 20 seconds, so one searcher with current and prepared reservations is counted once. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
+The Discord outcome keeps Reward, Inventory, Session, Total, and Fleet fields without a decorative embed image. Killer identity, server ID, search/hop time, joined-server count, and kill-server time are intentionally omitted. `Lifetime kills` and `Lifetime stingers` are presented as `Total Kill` and `Total Stinger`. `Stingers / hour` is calculated from session stingers divided by persistent session uptime. `Active searchers` counts unique `searcherId` values whose `/activeServers` heartbeat is no older than 20 seconds, so one searcher with current and prepared reservations is counted once. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
 
 After a killer teleport, the script does not resume normal queue polling until it can verify the expected claim in Firebase. Transient Firebase HTTP failures keep the killer in a recovery state. If Roblox routes an exact-instance teleport into a different server, the killer retries the same claimed destination up to five times before marking the job failed; it does not immediately abandon the claim and hop to another job.
 
