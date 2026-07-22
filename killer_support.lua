@@ -8,7 +8,7 @@ local TeleportService = game:GetService("TeleportService")
 local StarterGui = game:GetService("StarterGui")
 
 local BSS_PLACE_ID = 1537690962
-local DATABASE_URL = "https://bss-job-queue-7bf75-default-rtdb.firebaseio.com"
+local DATABASE_URL = "https://vichop-coordination-2026-default-rtdb.firebaseio.com"
 local STATS_FILE = "vichop_stats.json"
 local QUEUE_POLL_SECONDS = 0.75
 local ARRIVAL_WAIT_SECONDS = 15
