@@ -28,6 +28,9 @@ local TELEPORT_RETRIES = 3
 local ARRIVAL_COORDINATION_RETRY_SECONDS = 30
 local MAX_WRONG_SERVER_REDIRECTS = 3
 local SESSION_RESUME_MAX_AGE_SECONDS = 20 * 60
+local ACTIVE_SEARCHER_TTL_SECONDS = 20
+local ACTIVE_SEARCHER_REFRESH_SECONDS = 10
+local ACTIVE_SEARCHER_STALE_SECONDS = 45
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
 
@@ -134,6 +137,9 @@ local runtime = {
     cleanupRunning = false,
     redirectCount = math.max(0, tonumber(joinTeleportData.vichopRedirectCount) or 0),
     stingerSource = "Unavailable",
+    activeSearcherCount = nil,
+    activeSearcherCountAt = 0,
+    activeSearcherRefreshRunning = false,
 }
 env.__VICHOP_KILLER_RUNTIME = runtime
 
@@ -172,6 +178,10 @@ end
 local function formatDuration(seconds)
     seconds = math.max(0, math.floor(tonumber(seconds) or 0))
     return string.format("%02d:%02d:%02d", math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60)
+end
+
+local function formatRate(value)
+    return formatNumber(math.floor((tonumber(value) or 0) + 0.5)) .. "/hr"
 end
 
 local function defaultStats()
@@ -413,6 +423,58 @@ local function jobPath(key)
     return "/jobs/" .. tostring(key) .. ".json"
 end
 
+local function getActiveSearcherCount()
+    local reservations, readOk = firebaseGet("/activeServers.json")
+    if not readOk or type(reservations) ~= "table" then
+        return nil
+    end
+
+    local timestamp = now()
+    local activeIds = {}
+    for _, reservation in pairs(reservations) do
+        if type(reservation) == "table"
+            and tonumber(reservation.placeId) == game.PlaceId
+            and type(reservation.searcherId) == "string"
+            and tonumber(reservation.heartbeatAt or 0) >= timestamp - ACTIVE_SEARCHER_TTL_SECONDS then
+            activeIds[reservation.searcherId] = true
+        end
+    end
+
+    local count = 0
+    for _ in pairs(activeIds) do
+        count = count + 1
+    end
+    return count
+end
+
+local function refreshActiveSearcherCount()
+    if runtime.activeSearcherRefreshRunning then
+        return
+    end
+    runtime.activeSearcherRefreshRunning = true
+    task.spawn(function()
+        local count = getActiveSearcherCount()
+        if count ~= nil then
+            runtime.activeSearcherCount = count
+            runtime.activeSearcherCountAt = now()
+        end
+        runtime.activeSearcherRefreshRunning = false
+    end)
+end
+
+local function activeSearcherDisplay()
+    if runtime.activeSearcherCount == nil
+        or now() - runtime.activeSearcherCountAt > ACTIVE_SEARCHER_STALE_SECONDS then
+        return "Unknown"
+    end
+    return formatNumber(runtime.activeSearcherCount)
+end
+
+local function sessionStingersPerHour()
+    local uptime = math.max(1, now() - stats.startedAt)
+    return stats.sessionStingers * 3600 / uptime
+end
+
 local clientStatCache = nil
 local clientStatCacheChecked = false
 local function getClientStatCache()
@@ -525,9 +587,10 @@ local function updateHud()
     end
     hud.title.Text = "VICHOP  |  " .. runtime.state
     hud.body.Text = string.format(
-        "Kills       %s session  |  %s lifetime\nStingers    %s session  |  %s lifetime\nServers     %s session  |  %s lifetime\nServer      %s\nState       %s\nLast        %s\nUptime      %s",
+        "Kills       %s session  |  %s lifetime\nStingers    %s session  |  %s lifetime\nStingers/hr %s\nSearchers   %s active\nServers     %s session  |  %s lifetime\nServer      %s\nState       %s\nLast        %s\nUptime      %s",
         formatNumber(stats.sessionKills), formatNumber(stats.totalKills),
         formatNumber(stats.sessionStingers), formatNumber(stats.totalStingers),
+        formatRate(sessionStingersPerHour()), activeSearcherDisplay(),
         formatNumber(stats.sessionJoins), formatNumber(stats.totalJoins),
         shortJobId(game.JobId), runtime.detail, runtime.lastResult,
         formatDuration(now() - stats.startedAt)
@@ -585,6 +648,8 @@ local function sendWebhook(report)
                 { name = "Search / hop", value = "`" .. formatDuration(report.searchDuration) .. "`", inline = true },
                 { name = "Session kills", value = "`" .. formatNumber(stats.sessionKills) .. "`", inline = true },
                 { name = "Session stingers", value = "`" .. formatNumber(stats.sessionStingers) .. "`", inline = true },
+                { name = "Stingers / hour", value = "`" .. formatRate(sessionStingersPerHour()) .. "`", inline = true },
+                { name = "Active searchers", value = "`" .. activeSearcherDisplay() .. "`", inline = true },
                 { name = "Servers joined", value = "`" .. formatNumber(stats.sessionJoins) .. "`", inline = true },
                 { name = "Lifetime kills", value = "`" .. formatNumber(stats.totalKills) .. "`", inline = true },
                 { name = "Lifetime stingers", value = "`" .. formatNumber(stats.totalStingers) .. "`", inline = true },
@@ -1206,6 +1271,12 @@ local function runKiller()
         while runtime.active do
             updateHud()
             task.wait(0.5)
+        end
+    end)
+    task.spawn(function()
+        while runtime.active do
+            refreshActiveSearcherCount()
+            task.wait(ACTIVE_SEARCHER_REFRESH_SECONDS)
         end
     end)
 

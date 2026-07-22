@@ -233,11 +233,11 @@ If either side cannot be read, the job, tracker result, and Discord embed use `U
 
 ## Tracker and statistics
 
-When `Drawing` is supported, the killer tracker shows session and lifetime kills and stingers, joined servers, current state, shortened current server, last result, and session uptime. Console notifications remain available without `Drawing`.
+When `Drawing` is supported, the killer tracker shows session and lifetime kills and stingers, session stingers per hour, active searchers, joined servers, current state, shortened current server, last result, and session uptime. Console notifications remain available without `Drawing`.
 
 Lifetime and active-session values are stored in `vichop_stats.json`. The session ID is passed in teleport data and in the per-account local resume file, so session counters do not reset on every hop. Writes use a temporary file before replacing the main file. Invalid JSON is copied to a timestamped `.corrupt-*.json` backup when file APIs are available, then clean defaults are used.
 
-The Discord outcome uses inline Reward, Inventory, Session, Lifetime, and Server fields. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
+The Discord outcome uses inline Reward, Inventory, Session, Lifetime, Fleet, and Server fields. `Stingers / hour` is calculated from session stingers divided by persistent session uptime. `Active searchers` counts unique `searcherId` values whose `/activeServers` heartbeat is no older than 20 seconds, so one searcher with current and prepared reservations is counted once. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
 
 After a killer teleport, the script does not resume normal queue polling until it can verify the expected claim in Firebase. Transient Firebase HTTP failures keep the killer in a recovery state. If Roblox routes an exact-instance teleport into a different server, the killer retries the same claimed destination up to three times before marking the job failed; it does not immediately abandon the claim and hop to another job.
 
