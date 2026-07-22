@@ -50,8 +50,15 @@ local TRAVEL_MAX_VELOCITY = 145
 local TRAVEL_RESPONSIVENESS = 65
 local TRAVEL_REACHED_DISTANCE = 7
 local TRAVEL_REENTER_DISTANCE = 14
-local ACTIVATION_TOUCH_DISTANCE = 2.5
-local ACTIVATION_HOLD_SECONDS = 0.45
+local ACTIVATION_TOUCH_DISTANCE = 0.75
+local ACTIVATION_DISCOVERY_SECONDS = 2.5
+local ACTIVATION_APPROACH_CLEARANCE = 8
+local ACTIVATION_APPROACH_DISTANCE = 2.5
+local ACTIVATION_APPROACH_MAX_VELOCITY = 80
+local ACTIVATION_DROP_DEPTH = 5
+local ACTIVATION_DROP_MAX_VELOCITY = 35
+local ACTIVATION_DROP_RETRY_SECONDS = 2
+local ACTIVATION_HOLD_SECONDS = 0.15
 local ACTIVATION_TIMEOUT_SECONDS = 8
 local COMBAT_DISTANCE = 5
 local COMBAT_ORBIT_SPEED = 1.65
@@ -804,8 +811,11 @@ local movement = {
     overheadPlatform = nil,
     overheadField = nil,
     activationTarget = nil,
+    activationStage = "idle",
     activationStartedAt = 0,
+    activationDropStartedAt = 0,
     activationTouchedAt = 0,
+    activationTouchConnection = nil,
     orbitAngle = 0,
     lastCombatMoveAt = 0,
     originalAutoRotate = nil,
@@ -825,6 +835,31 @@ local function getViciousActivationSpike()
     local particles = workspace:FindFirstChild("Particles")
     local activation = particles and particles:FindFirstChild("Vicious")
     return activation and activation:IsA("BasePart") and activation or nil
+end
+
+local function distanceToPartBounds(position, part)
+    local localPosition = part.CFrame:PointToObjectSpace(position)
+    local halfSize = part.Size * 0.5
+    local closest = Vector3.new(
+        math.clamp(localPosition.X, -halfSize.X, halfSize.X),
+        math.clamp(localPosition.Y, -halfSize.Y, halfSize.Y),
+        math.clamp(localPosition.Z, -halfSize.Z, halfSize.Z)
+    )
+    return (position - part.CFrame:PointToWorldSpace(closest)).Magnitude
+end
+
+local function activationSweepPositions(activation)
+    local halfHeight = activation.Size.Y * 0.5
+    local position = activation.Position
+    return Vector3.new(
+        position.X,
+        position.Y + halfHeight + ACTIVATION_APPROACH_CLEARANCE,
+        position.Z
+    ), Vector3.new(
+        position.X,
+        position.Y - halfHeight - ACTIVATION_DROP_DEPTH,
+        position.Z
+    )
 end
 
 local function positionIsInsideZone(position, zone)
@@ -1039,10 +1074,12 @@ local function stopMovement(reason)
     movement.mode = "idle"
     movement.target = nil
     movement.activationTarget = nil
+    movement.activationStage = "idle"
     movement.activationStartedAt = 0
+    movement.activationDropStartedAt = 0
     movement.activationTouchedAt = 0
     disableTravelNoclip()
-    for _, connectionName in ipairs({ "updateConnection", "hazardConnection" }) do
+    for _, connectionName in ipairs({ "updateConnection", "hazardConnection", "activationTouchConnection" }) do
         local connection = movement[connectionName]
         movement[connectionName] = nil
         if connection then
@@ -1077,20 +1114,41 @@ runtime.stopMovement = stopMovement
 local function enterActivationMode(currentCharacter, humanoid, activationTarget)
     movement.mode = "activate"
     movement.activationTarget = activationTarget
+    movement.activationStage = "approach"
     movement.activationStartedAt = os.clock()
+    movement.activationDropStartedAt = 0
     movement.activationTouchedAt = 0
     humanoid.AutoRotate = false
     movement.alignPosition.Enabled = true
+    movement.alignPosition.MaxVelocity = ACTIVATION_APPROACH_MAX_VELOCITY
     movement.alignOrientation.Enabled = true
     enableTravelNoclip(currentCharacter)
-    print("[Vichop/Killer] Touching Vicious activation spike")
+    local root = currentCharacter:FindFirstChild("HumanoidRootPart")
+    if root then
+        movement.activationTouchConnection = root.Touched:Connect(function(otherPart)
+            if movement.mode == "activate" and movement.activationTouchedAt == 0
+                and otherPart == activationTarget then
+                movement.activationTouchedAt = os.clock()
+                print("[Vichop/Killer] Native contact with Vicious activation spike confirmed")
+            end
+        end)
+    end
+    print("[Vichop/Killer] Approaching above Vicious activation spike")
 end
 
 local function enterTravelMode(currentCharacter, humanoid)
     movement.mode = "travel"
     movement.activationTarget = nil
+    movement.activationStage = "idle"
+    movement.activationDropStartedAt = 0
+    if movement.activationTouchConnection then
+        movement.activationTouchConnection:Disconnect()
+        movement.activationTouchConnection = nil
+    end
     humanoid.AutoRotate = false
     movement.alignPosition.Enabled = true
+    movement.alignPosition.MaxVelocity = TRAVEL_MAX_VELOCITY
+    movement.alignPosition.Responsiveness = TRAVEL_RESPONSIVENESS
     movement.alignOrientation.Enabled = true
     enableTravelNoclip(currentCharacter)
 end
@@ -1153,6 +1211,7 @@ local function startMovement(monster)
     alignPosition.MaxVelocity = TRAVEL_MAX_VELOCITY
     alignPosition.Responsiveness = TRAVEL_RESPONSIVENESS
     alignPosition.RigidityEnabled = false
+    alignPosition.Enabled = false
     alignPosition.Parent = root
     movement.alignPosition = alignPosition
 
@@ -1163,13 +1222,21 @@ local function startMovement(monster)
     alignOrientation.MaxTorque = 1000000
     alignOrientation.Responsiveness = 45
     alignOrientation.RigidityEnabled = false
+    alignOrientation.Enabled = false
     alignOrientation.Parent = root
     movement.alignOrientation = alignOrientation
 
     local activationTarget = getViciousActivationSpike()
+    local activationDeadline = os.clock() + ACTIVATION_DISCOVERY_SECONDS
+    while not activationTarget and runtime.active and monster.Parent
+        and os.clock() < activationDeadline do
+        task.wait(0.1)
+        activationTarget = getViciousActivationSpike()
+    end
     if activationTarget then
         enterActivationMode(currentCharacter, humanoid, activationTarget)
     else
+        print("[Vichop/Killer] No activation spike present; Vicious appears to be active already")
         enterTravelMode(currentCharacter, humanoid)
     end
     local particles = workspace:FindFirstChild("Particles")
@@ -1198,28 +1265,65 @@ local function startMovement(monster)
             - Vector3.new(targetPosition.X, 0, targetPosition.Z)).Magnitude
         if movement.mode == "activate" then
             local activation = movement.activationTarget
-            if not activation or not activation.Parent
-                or os.clock() - movement.activationStartedAt >= ACTIVATION_TIMEOUT_SECONDS then
+            if not activation or not activation.Parent then
                 enterTravelMode(activeCharacter, activeHumanoid)
                 return
             end
-            movement.alignPosition.Position = activation.Position
-            if (activeRoot.Position - activation.Position).Magnitude > 0.1 then
-                movement.alignOrientation.CFrame = CFrame.lookAt(activeRoot.Position, activation.Position)
+
+            local timestamp = os.clock()
+            local abovePosition, belowPosition = activationSweepPositions(activation)
+            if movement.activationTouchedAt > 0 then
+                if timestamp - movement.activationTouchedAt >= ACTIVATION_HOLD_SECONDS then
+                    print("[Vichop/Killer] Vicious activation spike touched; moving to combat")
+                    enterTravelMode(activeCharacter, activeHumanoid)
+                end
+                return
             end
-            if (activeRoot.Position - activation.Position).Magnitude <= ACTIVATION_TOUCH_DISTANCE then
-                if movement.activationTouchedAt == 0 then
-                    movement.activationTouchedAt = os.clock()
+
+            if timestamp - movement.activationStartedAt >= ACTIVATION_TIMEOUT_SECONDS then
+                warn("[Vichop/Killer] Activation sweep timed out; applying touch fallback")
+                if type(firetouchinterest) == "function" then
+                    pcall(firetouchinterest, activeRoot, activation, 0)
+                    pcall(firetouchinterest, activeRoot, activation, 1)
+                end
+                enterTravelMode(activeCharacter, activeHumanoid)
+                return
+            end
+
+            if movement.activationStage == "approach" then
+                movement.alignPosition.Position = abovePosition
+                if (activeRoot.Position - abovePosition).Magnitude <= ACTIVATION_APPROACH_DISTANCE then
+                    movement.activationStage = "drop"
+                    movement.activationDropStartedAt = timestamp
+                    movement.alignPosition.MaxVelocity = ACTIVATION_DROP_MAX_VELOCITY
+                    activeRoot.AssemblyLinearVelocity = Vector3.zero
+                    print("[Vichop/Killer] Above activation spike; dropping through it")
+                end
+            else
+                movement.alignPosition.Position = belowPosition
+                local touchingBounds = distanceToPartBounds(activeRoot.Position, activation)
+                    <= ACTIVATION_TOUCH_DISTANCE
+                if touchingBounds then
+                    movement.activationTouchedAt = timestamp
                     if type(firetouchinterest) == "function" then
                         pcall(firetouchinterest, activeRoot, activation, 0)
                         pcall(firetouchinterest, activeRoot, activation, 1)
                     end
-                elseif os.clock() - movement.activationTouchedAt >= ACTIVATION_HOLD_SECONDS then
-                    print("[Vichop/Killer] Vicious activation spike touched; entering combat")
-                    enterTravelMode(activeCharacter, activeHumanoid)
+                elseif timestamp - movement.activationDropStartedAt >= ACTIVATION_DROP_RETRY_SECONDS
+                    or activeRoot.Position.Y <= belowPosition.Y + 1 then
+                    movement.activationStage = "approach"
+                    movement.activationDropStartedAt = 0
+                    movement.alignPosition.MaxVelocity = ACTIVATION_APPROACH_MAX_VELOCITY
+                    print("[Vichop/Killer] Spike contact missed; retrying vertical drop")
                 end
-            else
-                movement.activationTouchedAt = 0
+            end
+            local flatActivationPosition = Vector3.new(
+                activation.Position.X,
+                activeRoot.Position.Y,
+                activation.Position.Z
+            )
+            if (activeRoot.Position - flatActivationPosition).Magnitude > 0.1 then
+                movement.alignOrientation.CFrame = CFrame.lookAt(activeRoot.Position, flatActivationPosition)
             end
         elseif movement.mode == "travel" then
             local direction = Vector3.new(activeRoot.Position.X - targetPosition.X, 0, activeRoot.Position.Z - targetPosition.Z)
