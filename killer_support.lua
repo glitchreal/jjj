@@ -61,6 +61,8 @@ local ACTIVATION_DROP_RETRY_SECONDS = 2
 local ACTIVATION_HOLD_SECONDS = 0.15
 local ACTIVATION_TIMEOUT_SECONDS = 8
 local SPIKE_TRACK_SECONDS = 5
+local SPIKE_DANGER_RADIUS = 8
+local SPIKE_SAFE_CLEARANCE = 3
 local OVERHEAD_HEIGHT = 10
 local OVERHEAD_PLATFORM_SIZE = Vector3.new(20, 1, 20)
 local OVERHEAD_FOLLOW_SPEED = 8
@@ -1029,13 +1031,14 @@ local function observeSpikeCandidate(instance)
         movement.hazards[instance] = {
             observedAt = os.clock(),
             position = observedPosition,
-            priority = lowerName == "warningdisk" and 3 or (lowerName == "thorn" and 2 or 1),
+            dangerRadius = exactAttackSignal and SPIKE_DANGER_RADIUS
+                or math.max(4, math.max(instance.Size.X, instance.Size.Z) * 0.5 + 3),
         }
     end
 end
 
-local function getActiveSpikePosition()
-    local bestData
+local function getActiveSpikeHazards()
+    local hazards = {}
     local timestamp = os.clock()
     for instance, data in pairs(movement.hazards) do
         if not instance.Parent or timestamp - data.observedAt > SPIKE_TRACK_SECONDS then
@@ -1051,29 +1054,61 @@ local function getActiveSpikePosition()
             else
                 data.position = instance.Position
             end
-        end
-        if instance.Parent and timestamp - data.observedAt <= SPIKE_TRACK_SECONDS
-            and (not bestData or data.priority > bestData.priority
-            or (data.priority == bestData.priority and data.observedAt > bestData.observedAt)) then
-            bestData = data
+            table.insert(hazards, data)
         end
     end
-    return bestData and bestData.position or nil
+    return hazards
 end
 
-local function getHoverReferencePosition(targetPosition)
-    local spikePosition = getActiveSpikePosition()
-    if spikePosition then
-        movement.hoverReferenceKind = "spike"
-        return spikePosition
+local function spikeClearance(position, hazards)
+    local minimumClearance = math.huge
+    for _, hazard in ipairs(hazards) do
+        local horizontalDistance = (Vector2.new(position.X, position.Z)
+            - Vector2.new(hazard.position.X, hazard.position.Z)).Magnitude
+        minimumClearance = math.min(minimumClearance, horizontalDistance - hazard.dangerRadius)
     end
-    local activation = getViciousActivationSpike()
-    if activation and activation ~= movement.activationTarget then
-        movement.hoverReferenceKind = "spawn"
-        return activation.Position
+    return minimumClearance
+end
+
+local function getHoverReferencePosition(targetPosition, currentPlatformPosition)
+    local hazards = getActiveSpikeHazards()
+    if #hazards == 0 then
+        movement.hoverReferenceKind = "vicious"
+        return targetPosition
     end
-    movement.hoverReferenceKind = "vicious"
-    return targetPosition
+
+    local candidates = { targetPosition }
+    for _, radius in ipairs({ 10, 14, 18, 22 }) do
+        for index = 0, 15 do
+            local angle = index * math.pi / 8
+            table.insert(candidates, targetPosition + Vector3.new(
+                math.cos(angle) * radius,
+                0,
+                math.sin(angle) * radius
+            ))
+        end
+    end
+
+    local bestSafe, bestSafeCost, bestFallback, bestFallbackClearance
+    for _, candidate in ipairs(candidates) do
+        local clearance = spikeClearance(candidate, hazards)
+        local fromTarget = (Vector2.new(candidate.X, candidate.Z)
+            - Vector2.new(targetPosition.X, targetPosition.Z)).Magnitude
+        local fromCurrent = currentPlatformPosition and (Vector2.new(candidate.X, candidate.Z)
+            - Vector2.new(currentPlatformPosition.X, currentPlatformPosition.Z)).Magnitude or 0
+        local cost = fromTarget + fromCurrent * 0.15
+        if clearance >= SPIKE_SAFE_CLEARANCE and (not bestSafeCost or cost < bestSafeCost) then
+            bestSafe = candidate
+            bestSafeCost = cost
+        end
+        if not bestFallbackClearance or clearance > bestFallbackClearance then
+            bestFallback = candidate
+            bestFallbackClearance = clearance
+        end
+    end
+
+    movement.hoverReferenceKind = "dodging_spikes"
+    return bestSafe or bestFallback or targetPosition
 end
 
 local function movementFilter(currentCharacter, monster, platform)
@@ -1237,7 +1272,10 @@ local function enterOverheadMode(currentCharacter, humanoid, targetPosition, mon
     movement.alignOrientation.Enabled = false
     enableTravelNoclip(currentCharacter)
 
-    local referencePosition = getHoverReferencePosition(targetPosition)
+    local referencePosition = getHoverReferencePosition(
+        targetPosition,
+        movement.overheadPlatform and movement.overheadPlatform.Position or nil
+    )
     local safePosition = safeOverheadPlatformPosition(
         referencePosition,
         currentCharacter,
@@ -1401,7 +1439,10 @@ local function startMovement(monster)
                 movement.alignOrientation.CFrame = CFrame.lookAt(activeRoot.Position, flatActivationPosition)
             end
         elseif movement.mode == "overhead" or movement.mode == "hover" then
-            local referencePosition = getHoverReferencePosition(targetPosition)
+            local referencePosition = getHoverReferencePosition(
+                targetPosition,
+                movement.overheadPlatform and movement.overheadPlatform.Position or activeRoot.Position
+            )
             local safePosition = safeOverheadPlatformPosition(
                 referencePosition,
                 activeCharacter,
