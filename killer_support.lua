@@ -191,6 +191,7 @@ local runtime = {
     hiveClaimed = false,
     hiveName = nil,
     emergencyRejoinActive = false,
+    tweenSpeedSavePending = false,
     hiveTweenSpeed = math.clamp(
         tonumber(env.VICHOP_HIVE_TWEEN_SPEED) or DEFAULT_HIVE_APPROACH_SPEED,
         MIN_HIVE_APPROACH_SPEED,
@@ -255,6 +256,7 @@ local function defaultStats()
         updatedAt = now(),
         lastCountedJobId = "",
         lastKillEventId = "",
+        hiveTweenSpeed = DEFAULT_HIVE_APPROACH_SPEED,
     }
 end
 
@@ -291,6 +293,11 @@ local function loadStats()
     end
     stats.lastKillEventId = type(saved.lastKillEventId) == "string" and saved.lastKillEventId or ""
     stats.lastCountedJobId = type(saved.lastCountedJobId) == "string" and saved.lastCountedJobId or ""
+    stats.hiveTweenSpeed = math.clamp(
+        tonumber(saved.hiveTweenSpeed) or stats.hiveTweenSpeed,
+        MIN_HIVE_APPROACH_SPEED,
+        MAX_HIVE_APPROACH_SPEED
+    )
 
     local migrateHiddenSession = HIDE_KILLER_USER and type(saved.sessionId) == "string"
         and string.match(saved.sessionId, "^killer%-%d+%-") ~= nil
@@ -305,6 +312,12 @@ local function loadStats()
 end
 
 local stats = loadStats()
+runtime.hiveTweenSpeed = math.clamp(
+    tonumber(env.VICHOP_HIVE_TWEEN_SPEED) or stats.hiveTweenSpeed or DEFAULT_HIVE_APPROACH_SPEED,
+    MIN_HIVE_APPROACH_SPEED,
+    MAX_HIVE_APPROACH_SPEED
+)
+env.VICHOP_HIVE_TWEEN_SPEED = runtime.hiveTweenSpeed
 
 local function saveStats()
     stats.updatedAt = now()
@@ -331,6 +344,26 @@ local function saveStats()
         warn("[Vichop/Killer] Could not save stats:", tostring(finalError))
     end
     return finalOk
+end
+
+local function saveHiveTweenSpeed(immediate)
+    stats.hiveTweenSpeed = runtime.hiveTweenSpeed
+    if immediate then
+        runtime.tweenSpeedSavePending = false
+        return saveStats()
+    end
+    if runtime.tweenSpeedSavePending then
+        return true
+    end
+    runtime.tweenSpeedSavePending = true
+    task.delay(0.35, function()
+        if env.__VICHOP_KILLER_RUNTIME == runtime then
+            stats.hiveTweenSpeed = runtime.hiveTweenSpeed
+            saveStats()
+        end
+        runtime.tweenSpeedSavePending = false
+    end)
+    return true
 end
 
 if stats.lastCountedJobId ~= game.JobId then
@@ -1735,6 +1768,7 @@ local function createHud()
             MIN_HIVE_APPROACH_SPEED + alpha * (MAX_HIVE_APPROACH_SPEED - MIN_HIVE_APPROACH_SPEED) + 0.5
         )
         env.VICHOP_HIVE_TWEEN_SPEED = runtime.hiveTweenSpeed
+        saveHiveTweenSpeed(false)
         renderSpeed()
     end
     renderSpeed()
@@ -1779,6 +1813,9 @@ local function createHud()
     trackHudConnection(UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
+            if draggingSlider then
+                saveHiveTweenSpeed(true)
+            end
             draggingWindow = false
             draggingSlider = false
         end
