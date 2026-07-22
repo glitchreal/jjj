@@ -142,6 +142,7 @@ Configure the Discord webhook before the killer loadstring in its autoexecute fi
 ```lua
 getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
 getgenv().VICHOP_HIDE_KILLER_USER = true
+getgenv().VICHOP_HIVE_TWEEN_SPEED = 55 -- optional; clamped to 25-90
 -- Optional: replace the repository-owned Vaporwave banner.
 -- getgenv().VICHOP_WEBHOOK_IMAGE_URL = "https://example.com/banner.png"
 -- Use the full retrying killer loader above after setting the webhook.
@@ -170,15 +171,15 @@ Available modes:
 
 - `off` makes no rendering changes. Setting `VICHOP_ANTILAG_ENABLED` to `false` also selects this mode.
 - `safe` disables effects, sounds, lights, post-processing, shadows, decals, and textures through normal instance properties. It does not destroy map objects.
-- `aggressive` is the default for dedicated searchers. In addition to safe rendering changes, it destroys class-identified visual and audio effects and locally hides unprotected map parts. It does not destroy parts, meshes, models, folders, or top-level Workspace containers.
+- `aggressive` is the default for dedicated searchers. In addition to safe rendering changes, it locally hides unprotected map parts. Effects such as beams and trails are disabled in place so game scripts can continue referencing them; anti-lag does not destroy game instances.
 
 Both active modes lower rendering quality, disable global shadows, and reduce Terrain water effects when Roblox allows those property changes. Initial work starts only after the character readiness checks and a bounded wait for `Workspace.Monsters`. The first Vicious scan runs before cleanup, and cleanup is yielded in batches. One guarded `DescendantAdded` connection handles later effects without creating per-instance listeners. A compact health line is printed on hop 1 and every 10 hops.
 
-The preserve rules leave `Workspace.Monsters` and everything beneath it untouched, including Vicious models, `MonsterType`, Humanoid, and level data. They also protect the local character, HumanoidRootPart, current Camera, Terrain itself, Roblox services, and instances with uncertain ancestry. The anti-lag path requires no Drawing API, hidden-property changes, hooks, debug APIs, or filesystem APIs. Filesystem support remains optional for the searcher's existing cross-teleport resume context.
+The preserve rules leave `Workspace.Monsters` and everything beneath it untouched, including Vicious models, `MonsterType`, Humanoid, and level data. They also protect the local character, HumanoidRootPart, current Camera, Terrain itself, Roblox services, and instances with uncertain ancestry. The anti-lag path does not modify `RenderFidelity` at runtime and requires no Drawing API, hidden-property changes, hooks, debug APIs, or filesystem APIs. Filesystem support remains optional for the searcher's existing cross-teleport resume context.
 
-Aggressive mode intentionally makes most of the map invisible and removes client-side sound and effects. Use it only on dedicated searcher accounts; use `safe` while troubleshooting executor or game-update compatibility. Searcher anti-lag does not run on the killer.
+Aggressive mode intentionally makes most of the map invisible and silences or disables client-side sound and effects. Use it only on dedicated searcher accounts; use `safe` while troubleshooting executor or game-update compatibility. Searcher anti-lag does not run on the killer. After upgrading from an older version that already deleted a game-owned effect, rejoin once so Roblox can restore that instance before loading the new script.
 
-Every searcher hides Bee Swarm's `PlayerGui.ScreenGui.Tutorial` and `TutorialButton`, including attempts by the game to show them again. A centered, bold status panel displays `Hopping` while no live Vicious Bee is present and changes to `Spawned` as soon as a living Vicious Bee is detected.
+Every searcher hides Bee Swarm's `PlayerGui.ScreenGui.Tutorial` and `TutorialButton`, including attempts by the game to show them again. A compact centered dark panel displays `Hopping` while no live Vicious Bee is present and changes its status dot and accent to green with `Spawned` as soon as a living Vicious Bee is detected.
 
 ## Firebase data
 
@@ -279,7 +280,7 @@ If either side cannot be read, the job, tracker result, and Discord embed use `U
 
 ## Tracker and statistics
 
-When `Drawing` is supported, the centered killer tracker uses a black panel, neon-green `Vichopper Made By Qitch` title, larger outlined text, and shows session kills and stingers, Total Kill, Total Stinger, stingers per hour, active searchers, current state, last result, and session uptime. Server ID and joined-server statistics are intentionally hidden. Console notifications remain available without `Drawing`.
+The killer tracker is a centered native Roblox panel with a restrained black-and-neon theme, compact typography, and an animated green-to-black `Vichop Made By Qitch` title. Drag its header to reposition it. Its hive tween-speed slider ranges from 25 to 90 studs per second and defaults to 55; changes apply to the next hive approach and persist through the executor environment. It shows session kills and stingers, Total Kill, Total Stinger, stingers per hour, active searchers, current state, last result, and session uptime. Server ID and joined-server statistics are intentionally hidden.
 
 Lifetime and active-session values are stored in `vichop_stats.json`. The session ID is passed in teleport data and in the per-account local resume file, so session counters do not reset on every hop. Writes use a temporary file before replacing the main file. Invalid JSON is copied to a timestamped `.corrupt-*.json` backup when file APIs are available, then clean defaults are used.
 
@@ -293,7 +294,7 @@ Both roles listen for Roblox `GuiService` connection and kick errors. They first
 
 - An executor HTTP request function (`request`, `http_request`, or `syn.request`) is required for Firebase coordination and background candidate discovery.
 - Executor autoexecute is required for continuous hopping; `queue_on_teleport` is not used.
-- `Drawing` is optional; its absence disables only the visual tracker.
+- The status trackers use native Roblox `ScreenGui` instances and do not require the executor Drawing API.
 - Local file APIs preserve searcher resume context and provide a fallback when killer `TeleportData` is dropped. Without them, same-server comparison and killer claim resume are unavailable. Their absence also disables persistent lifetime statistics.
 - The webhook is optional and disabled when `VICHOP_WEBHOOK_URL` is empty.
 - Firebase atomic coordination requires response headers, including `ETag`, to be exposed by the executor request API.

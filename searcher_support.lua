@@ -215,39 +215,84 @@ local function installSearcherUi()
     screenGui.IgnoreGuiInset = true
     screenGui.DisplayOrder = 1000
 
-    local label = Instance.new("TextLabel")
-    label.Name = "Status"
-    label.AnchorPoint = Vector2.new(0.5, 0.5)
-    label.Position = UDim2.fromScale(0.5, 0.5)
-    label.Size = UDim2.fromOffset(260, 74)
-    label.BackgroundColor3 = Color3.fromRGB(255, 220, 55)
-    label.BackgroundTransparency = 0.08
-    label.BorderSizePixel = 0
-    label.Text = "Hopping"
-    label.TextColor3 = Color3.fromRGB(18, 20, 22)
-    label.TextStrokeColor3 = Color3.fromRGB(255, 255, 255)
-    label.TextStrokeTransparency = 0.55
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 32
-    label.Parent = screenGui
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.AnchorPoint = Vector2.new(0.5, 0.5)
+    panel.Position = UDim2.fromScale(0.5, 0.5)
+    panel.Size = UDim2.fromOffset(224, 58)
+    panel.BackgroundColor3 = Color3.fromRGB(12, 15, 14)
+    panel.BackgroundTransparency = 0.08
+    panel.BorderSizePixel = 0
+    panel.Parent = screenGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 7)
+    corner.Parent = panel
 
     local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(18, 20, 22)
-    stroke.Thickness = 3
-    stroke.Parent = label
+    stroke.Name = "AccentStroke"
+    stroke.Color = Color3.fromRGB(255, 199, 61)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.15
+    stroke.Parent = panel
+
+    local dot = Instance.new("Frame")
+    dot.Name = "StatusDot"
+    dot.AnchorPoint = Vector2.new(0, 0.5)
+    dot.Position = UDim2.new(0, 16, 0.5, 0)
+    dot.Size = UDim2.fromOffset(10, 10)
+    dot.BackgroundColor3 = Color3.fromRGB(255, 199, 61)
+    dot.BorderSizePixel = 0
+    dot.Parent = panel
+    local dotCorner = Instance.new("UICorner")
+    dotCorner.CornerRadius = UDim.new(1, 0)
+    dotCorner.Parent = dot
+
+    local eyebrow = Instance.new("TextLabel")
+    eyebrow.Name = "Eyebrow"
+    eyebrow.Position = UDim2.fromOffset(38, 9)
+    eyebrow.Size = UDim2.new(1, -50, 0, 13)
+    eyebrow.BackgroundTransparency = 1
+    eyebrow.Text = "VICHOP SEARCHER"
+    eyebrow.TextColor3 = Color3.fromRGB(129, 142, 135)
+    eyebrow.TextXAlignment = Enum.TextXAlignment.Left
+    eyebrow.Font = Enum.Font.GothamMedium
+    eyebrow.TextSize = 10
+    eyebrow.Parent = panel
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Status"
+    label.Position = UDim2.fromOffset(38, 22)
+    label.Size = UDim2.new(1, -50, 0, 26)
+    label.BackgroundTransparency = 1
+    label.Text = "Hopping"
+    label.TextColor3 = Color3.fromRGB(245, 247, 246)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamSemibold
+    label.TextSize = 18
+    label.Parent = panel
 
     screenGui.Parent = playerGui
     runtime.statusGui = screenGui
 end
 
 local function setSearcherStatus(status)
-    local label = runtime.statusGui and runtime.statusGui:FindFirstChild("Status")
+    local panel = runtime.statusGui and runtime.statusGui:FindFirstChild("Panel")
+    local label = panel and panel:FindFirstChild("Status")
     if not label then
         return
     end
     local spawned = status == "Spawned"
     label.Text = spawned and "Spawned" or "Hopping"
-    label.BackgroundColor3 = spawned and Color3.fromRGB(57, 255, 20) or Color3.fromRGB(255, 220, 55)
+    local accent = spawned and Color3.fromRGB(57, 255, 20) or Color3.fromRGB(255, 199, 61)
+    local dot = panel:FindFirstChild("StatusDot")
+    local stroke = panel:FindFirstChild("AccentStroke")
+    if dot then
+        dot.BackgroundColor3 = accent
+    end
+    if stroke then
+        stroke.Color = accent
+    end
 end
 
 local function readResumeContext()
@@ -318,29 +363,6 @@ local queuedAntiLagInstances = setmetatable({}, { __mode = "k" })
 local antiLagQueue = {}
 local antiLagQueueHead = 1
 local antiLagQueueTail = 0
-
-local destroyInAggressiveMode = {
-    ParticleEmitter = true,
-    Trail = true,
-    Beam = true,
-    Smoke = true,
-    Fire = true,
-    Sparkles = true,
-    Sound = true,
-    PointLight = true,
-    SpotLight = true,
-    SurfaceLight = true,
-    Decal = true,
-    Texture = true,
-    SurfaceAppearance = true,
-    Highlight = true,
-    SelectionBox = true,
-    BloomEffect = true,
-    BlurEffect = true,
-    ColorCorrectionEffect = true,
-    DepthOfFieldEffect = true,
-    SunRaysEffect = true,
-}
 
 local disableInSafeMode = {
     ParticleEmitter = true,
@@ -422,7 +444,12 @@ local function isAntiLagCandidate(instance)
     if not instance then
         return false
     end
-    return destroyInAggressiveMode[instance.ClassName] == true or instance:IsA("BasePart")
+    return disableInSafeMode[instance.ClassName] == true
+        or instance:IsA("BasePart")
+        or instance:IsA("Sound")
+        or instance:IsA("Decal")
+        or instance:IsA("Texture")
+        or instance:IsA("SelectionBox")
 end
 
 local function optimizeInstance(instance)
@@ -434,16 +461,6 @@ local function optimizeInstance(instance)
 
     if isProtected(instance) then
         runtime.antiLag.protected = runtime.antiLag.protected + 1
-        return
-    end
-
-    if ANTILAG_MODE == "aggressive" and destroyInAggressiveMode[instance.ClassName] then
-        local destroyed = pcall(function()
-            instance:Destroy()
-        end)
-        if destroyed then
-            runtime.antiLag.destroyed = runtime.antiLag.destroyed + 1
-        end
         return
     end
 
@@ -465,9 +482,6 @@ local function optimizeInstance(instance)
         changed = setProperty(instance, "CastShadow", false) or changed
         if ANTILAG_MODE == "aggressive" then
             changed = setProperty(instance, "LocalTransparencyModifier", 1) or changed
-            if instance:IsA("MeshPart") then
-                changed = setProperty(instance, "RenderFidelity", Enum.RenderFidelity.Performance) or changed
-            end
         end
     end
 

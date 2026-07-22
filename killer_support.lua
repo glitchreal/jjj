@@ -10,6 +10,7 @@ local RunService = game:GetService("RunService")
 local TeleportService = game:GetService("TeleportService")
 local StarterGui = game:GetService("StarterGui")
 local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
 
 local BSS_PLACE_ID = 1537690962
 local DATABASE_URL = "https://vichop-coordination-2026-default-rtdb.firebaseio.com"
@@ -41,8 +42,10 @@ local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
 local HIVE_CLAIM_TIMEOUT_SECONDS = 3
 local HIVE_CLAIM_RETRY_SECONDS = 0.35
-local HIVE_APPROACH_SPEED = 90
-local HIVE_APPROACH_MAX_SECONDS = 2.5
+local DEFAULT_HIVE_APPROACH_SPEED = 55
+local MIN_HIVE_APPROACH_SPEED = 25
+local MAX_HIVE_APPROACH_SPEED = 90
+local HIVE_APPROACH_MAX_SECONDS = 5
 local TRAVEL_MAX_VELOCITY = 145
 local TRAVEL_RESPONSIVENESS = 65
 local TRAVEL_REACHED_DISTANCE = 7
@@ -181,6 +184,11 @@ local runtime = {
     hiveClaimed = false,
     hiveName = nil,
     emergencyRejoinActive = false,
+    hiveTweenSpeed = math.clamp(
+        tonumber(env.VICHOP_HIVE_TWEEN_SPEED) or DEFAULT_HIVE_APPROACH_SPEED,
+        MIN_HIVE_APPROACH_SPEED,
+        MAX_HIVE_APPROACH_SPEED
+    ),
 }
 env.__VICHOP_KILLER_RUNTIME = runtime
 
@@ -682,7 +690,11 @@ local function tweenToHivePlatform(platform, platformPart)
     end
 
     local target = platformPart.CFrame * CFrame.new(0, 3.25, 0)
-    local duration = math.clamp((root.Position - target.Position).Magnitude / HIVE_APPROACH_SPEED, 0.15, HIVE_APPROACH_MAX_SECONDS)
+    local duration = math.clamp(
+        (root.Position - target.Position).Magnitude / runtime.hiveTweenSpeed,
+        0.2,
+        HIVE_APPROACH_MAX_SECONDS
+    )
     local tweenOk, tween = pcall(
         TweenService.Create,
         TweenService,
@@ -1274,87 +1286,365 @@ local function startMovement(monster)
     return true
 end
 
-local hud = {}
-local function positionHud()
-    if not hud.background then
-        return
-    end
-    local camera = workspace.CurrentCamera
-    local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
-    local size = Vector2.new(430, 190)
-    local origin = Vector2.new(math.floor((viewport.X - size.X) * 0.5), math.floor((viewport.Y - size.Y) * 0.5))
-    hud.background.Size = size
-    hud.background.Position = origin
-    hud.accent.Size = Vector2.new(5, size.Y)
-    hud.accent.Position = origin
-    hud.title.Position = origin + Vector2.new(20, 13)
-    hud.body.Position = origin + Vector2.new(20, 45)
+local hud = { connections = {}, values = {} }
+
+local function trackHudConnection(connection)
+    table.insert(hud.connections, connection)
+    return connection
 end
 
-local function createHud()
-    if not Drawing or type(Drawing.new) ~= "function" then
-        return
-    end
-    local ok = pcall(function()
-        hud.background = Drawing.new("Square")
-        hud.background.Color = Color3.fromRGB(0, 0, 0)
-        hud.background.Transparency = 0.08
-        hud.background.Filled = true
-        hud.background.Visible = true
+local function newLabel(parent, name, position, size, text, textSize, color, font)
+    local label = Instance.new("TextLabel")
+    label.Name = name
+    label.Position = position
+    label.Size = size
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = color
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.Font = font or Enum.Font.GothamMedium
+    label.TextSize = textSize
+    label.Parent = parent
+    return label
+end
 
-        hud.accent = Drawing.new("Square")
-        hud.accent.Color = Color3.fromRGB(57, 255, 20)
-        hud.accent.Transparency = 0
-        hud.accent.Filled = true
-        hud.accent.Visible = true
-
-        hud.title = Drawing.new("Text")
-        hud.title.Color = Color3.fromRGB(57, 255, 20)
-        hud.title.Outline = true
-        hud.title.OutlineColor = Color3.fromRGB(0, 0, 0)
-        hud.title.Size = 20
-        hud.title.Font = 2
-        hud.title.Visible = true
-
-        hud.body = Drawing.new("Text")
-        hud.body.Color = Color3.fromRGB(235, 255, 235)
-        hud.body.Outline = true
-        hud.body.OutlineColor = Color3.fromRGB(0, 0, 0)
-        hud.body.Size = 17
-        hud.body.Font = 2
-        hud.body.Visible = true
-        positionHud()
-    end)
-    if not ok then
-        hud = {}
-        warn("[Vichop/Killer] Drawing tracker could not be created; using console notifications")
-    end
+local function addStat(parent, key, caption, x, y)
+    newLabel(
+        parent,
+        key .. "Caption",
+        UDim2.fromOffset(x, y),
+        UDim2.fromOffset(128, 14),
+        string.upper(caption),
+        10,
+        Color3.fromRGB(119, 132, 125),
+        Enum.Font.GothamMedium
+    )
+    hud.values[key] = newLabel(
+        parent,
+        key,
+        UDim2.fromOffset(x, y + 14),
+        UDim2.fromOffset(128, 24),
+        "0",
+        17,
+        Color3.fromRGB(238, 244, 240),
+        Enum.Font.GothamSemibold
+    )
 end
 
 local function destroyHud()
-    for _, drawing in pairs(hud) do
-        pcall(function()
-            drawing:Remove()
-        end)
+    for _, connection in ipairs(hud.connections or {}) do
+        pcall(connection.Disconnect, connection)
     end
-    hud = {}
+    if hud.screenGui then
+        pcall(hud.screenGui.Destroy, hud.screenGui)
+    end
+    hud = { connections = {}, values = {} }
 end
 runtime.destroyHud = destroyHud
 
-local function updateHud()
-    if not hud.title then
+local function createHud()
+    local playerGui = PLAYER:FindFirstChildOfClass("PlayerGui") or PLAYER:WaitForChild("PlayerGui", 5)
+    if not playerGui then
+        warn("[Vichop/Killer] PlayerGui unavailable; using console notifications")
         return
     end
-    positionHud()
-    hud.title.Text = "Vichopper Made By Qitch"
-    hud.body.Text = string.format(
-        "Kills       %s session  |  Total Kill %s\nStingers    %s session  |  Total Stinger %s\nStingers/hr %s\nSearchers   %s active\nState       %s\nLast        %s\nUptime      %s",
-        formatNumber(stats.sessionKills), formatNumber(stats.totalKills),
-        formatNumber(stats.sessionStingers), formatNumber(stats.totalStingers),
-        formatRate(sessionStingersPerHour()), activeSearcherDisplay(),
-        runtime.detail, runtime.lastResult,
-        formatDuration(now() - stats.startedAt)
+    local old = playerGui:FindFirstChild("VichopKillerHud")
+    if old then
+        old:Destroy()
+    end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "VichopKillerHud"
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder = 1000
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.Parent = playerGui
+    hud.screenGui = screenGui
+
+    local shadow = Instance.new("Frame")
+    shadow.Name = "Shadow"
+    shadow.AnchorPoint = Vector2.new(0.5, 0.5)
+    shadow.Position = UDim2.new(0.5, 5, 0.5, 7)
+    shadow.Size = UDim2.fromOffset(460, 300)
+    shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    shadow.BackgroundTransparency = 0.42
+    shadow.BorderSizePixel = 0
+    shadow.Parent = screenGui
+    local shadowCorner = Instance.new("UICorner")
+    shadowCorner.CornerRadius = UDim.new(0, 8)
+    shadowCorner.Parent = shadow
+
+    local window = Instance.new("Frame")
+    window.Name = "Window"
+    window.AnchorPoint = Vector2.new(0.5, 0.5)
+    window.Position = UDim2.fromScale(0.5, 0.5)
+    window.Size = UDim2.fromOffset(460, 300)
+    window.BackgroundColor3 = Color3.fromRGB(10, 13, 12)
+    window.BackgroundTransparency = 0.04
+    window.BorderSizePixel = 0
+    window.Parent = screenGui
+    hud.window = window
+
+    local windowCorner = Instance.new("UICorner")
+    windowCorner.CornerRadius = UDim.new(0, 8)
+    windowCorner.Parent = window
+    local windowStroke = Instance.new("UIStroke")
+    windowStroke.Color = Color3.fromRGB(57, 255, 20)
+    windowStroke.Thickness = 1.5
+    windowStroke.Transparency = 0.2
+    windowStroke.Parent = window
+
+    local header = Instance.new("Frame")
+    header.Name = "Header"
+    header.Size = UDim2.new(1, 0, 0, 52)
+    header.BackgroundColor3 = Color3.fromRGB(15, 20, 17)
+    header.BackgroundTransparency = 0.12
+    header.BorderSizePixel = 0
+    header.Active = true
+    header.Parent = window
+    local headerCorner = Instance.new("UICorner")
+    headerCorner.CornerRadius = UDim.new(0, 8)
+    headerCorner.Parent = header
+
+    local title = newLabel(
+        header,
+        "Title",
+        UDim2.fromOffset(18, 0),
+        UDim2.new(1, -150, 1, 0),
+        "Vichop Made By Qitch",
+        17,
+        Color3.fromRGB(57, 255, 20),
+        Enum.Font.GothamSemibold
     )
+    title.TextStrokeTransparency = 0.35
+    hud.title = title
+
+    local status = Instance.new("TextLabel")
+    status.Name = "Status"
+    status.AnchorPoint = Vector2.new(1, 0.5)
+    status.Position = UDim2.new(1, -16, 0.5, 0)
+    status.Size = UDim2.fromOffset(112, 26)
+    status.BackgroundColor3 = Color3.fromRGB(22, 35, 26)
+    status.BackgroundTransparency = 0.05
+    status.BorderSizePixel = 0
+    status.Text = runtime.state
+    status.TextColor3 = Color3.fromRGB(97, 255, 120)
+    status.Font = Enum.Font.GothamSemibold
+    status.TextSize = 11
+    status.Parent = header
+    local statusCorner = Instance.new("UICorner")
+    statusCorner.CornerRadius = UDim.new(1, 0)
+    statusCorner.Parent = status
+    hud.status = status
+
+    local divider = Instance.new("Frame")
+    divider.Position = UDim2.fromOffset(18, 52)
+    divider.Size = UDim2.new(1, -36, 0, 1)
+    divider.BackgroundColor3 = Color3.fromRGB(46, 56, 50)
+    divider.BackgroundTransparency = 0.3
+    divider.BorderSizePixel = 0
+    divider.Parent = window
+
+    addStat(window, "sessionKills", "Session kills", 20, 68)
+    addStat(window, "totalKills", "Total kill", 166, 68)
+    addStat(window, "stingersPerHour", "Stingers / hour", 312, 68)
+    addStat(window, "sessionStingers", "Session stingers", 20, 116)
+    addStat(window, "totalStingers", "Total stinger", 166, 116)
+    addStat(window, "searchers", "Active searchers", 312, 116)
+
+    newLabel(
+        window,
+        "LastCaption",
+        UDim2.fromOffset(20, 165),
+        UDim2.fromOffset(110, 14),
+        "LAST RESULT",
+        10,
+        Color3.fromRGB(119, 132, 125),
+        Enum.Font.GothamMedium
+    )
+    hud.lastResult = newLabel(
+        window,
+        "LastResult",
+        UDim2.fromOffset(20, 179),
+        UDim2.new(1, -40, 0, 24),
+        runtime.lastResult,
+        14,
+        Color3.fromRGB(224, 232, 227),
+        Enum.Font.GothamMedium
+    )
+    hud.detail = newLabel(
+        window,
+        "Detail",
+        UDim2.fromOffset(20, 201),
+        UDim2.new(1, -40, 0, 20),
+        runtime.detail,
+        11,
+        Color3.fromRGB(126, 143, 133),
+        Enum.Font.GothamMedium
+    )
+
+    newLabel(
+        window,
+        "SpeedCaption",
+        UDim2.fromOffset(20, 229),
+        UDim2.fromOffset(180, 18),
+        "HIVE TWEEN SPEED",
+        10,
+        Color3.fromRGB(119, 132, 125),
+        Enum.Font.GothamMedium
+    )
+    hud.speedValue = newLabel(
+        window,
+        "SpeedValue",
+        UDim2.new(1, -120, 0, 226),
+        UDim2.fromOffset(100, 22),
+        tostring(math.floor(runtime.hiveTweenSpeed + 0.5)),
+        13,
+        Color3.fromRGB(97, 255, 120),
+        Enum.Font.GothamSemibold
+    )
+    hud.speedValue.TextXAlignment = Enum.TextXAlignment.Right
+
+    local sliderTrack = Instance.new("Frame")
+    sliderTrack.Name = "SliderTrack"
+    sliderTrack.Position = UDim2.fromOffset(20, 257)
+    sliderTrack.Size = UDim2.new(1, -40, 0, 6)
+    sliderTrack.BackgroundColor3 = Color3.fromRGB(40, 49, 44)
+    sliderTrack.BorderSizePixel = 0
+    sliderTrack.Parent = window
+    local trackCorner = Instance.new("UICorner")
+    trackCorner.CornerRadius = UDim.new(1, 0)
+    trackCorner.Parent = sliderTrack
+
+    local sliderFill = Instance.new("Frame")
+    sliderFill.Name = "Fill"
+    sliderFill.Size = UDim2.fromScale(0, 1)
+    sliderFill.BackgroundColor3 = Color3.fromRGB(57, 255, 20)
+    sliderFill.BorderSizePixel = 0
+    sliderFill.Parent = sliderTrack
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(1, 0)
+    fillCorner.Parent = sliderFill
+    hud.sliderFill = sliderFill
+
+    local sliderKnob = Instance.new("Frame")
+    sliderKnob.Name = "Knob"
+    sliderKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+    sliderKnob.Position = UDim2.fromScale(0, 0.5)
+    sliderKnob.Size = UDim2.fromOffset(16, 16)
+    sliderKnob.BackgroundColor3 = Color3.fromRGB(235, 255, 239)
+    sliderKnob.BorderSizePixel = 0
+    sliderKnob.ZIndex = 3
+    sliderKnob.Parent = sliderTrack
+    local knobCorner = Instance.new("UICorner")
+    knobCorner.CornerRadius = UDim.new(1, 0)
+    knobCorner.Parent = sliderKnob
+    local knobStroke = Instance.new("UIStroke")
+    knobStroke.Color = Color3.fromRGB(57, 255, 20)
+    knobStroke.Thickness = 2
+    knobStroke.Parent = sliderKnob
+    hud.sliderKnob = sliderKnob
+
+    local sliderInput = Instance.new("TextButton")
+    sliderInput.Name = "SliderInput"
+    sliderInput.Position = UDim2.fromOffset(0, -10)
+    sliderInput.Size = UDim2.new(1, 0, 1, 20)
+    sliderInput.BackgroundTransparency = 1
+    sliderInput.Text = ""
+    sliderInput.ZIndex = 4
+    sliderInput.Parent = sliderTrack
+
+    local function renderSpeed()
+        local alpha = (runtime.hiveTweenSpeed - MIN_HIVE_APPROACH_SPEED)
+            / (MAX_HIVE_APPROACH_SPEED - MIN_HIVE_APPROACH_SPEED)
+        alpha = math.clamp(alpha, 0, 1)
+        sliderFill.Size = UDim2.fromScale(alpha, 1)
+        sliderKnob.Position = UDim2.fromScale(alpha, 0.5)
+        hud.speedValue.Text = tostring(math.floor(runtime.hiveTweenSpeed + 0.5)) .. " studs/s"
+    end
+    local function setSpeedFromX(x)
+        local width = math.max(sliderTrack.AbsoluteSize.X, 1)
+        local alpha = math.clamp((x - sliderTrack.AbsolutePosition.X) / width, 0, 1)
+        runtime.hiveTweenSpeed = math.floor(
+            MIN_HIVE_APPROACH_SPEED + alpha * (MAX_HIVE_APPROACH_SPEED - MIN_HIVE_APPROACH_SPEED) + 0.5
+        )
+        env.VICHOP_HIVE_TWEEN_SPEED = runtime.hiveTweenSpeed
+        renderSpeed()
+    end
+    renderSpeed()
+
+    local draggingWindow = false
+    local draggingSlider = false
+    local dragStart
+    local windowStart
+    trackHudConnection(header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            draggingWindow = true
+            dragStart = input.Position
+            windowStart = window.Position
+        end
+    end))
+    trackHudConnection(sliderInput.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            draggingSlider = true
+            setSpeedFromX(input.Position.X)
+        end
+    end))
+    trackHudConnection(UserInputService.InputChanged:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+        if draggingWindow and dragStart and windowStart then
+            local delta = input.Position - dragStart
+            window.Position = UDim2.new(
+                windowStart.X.Scale,
+                windowStart.X.Offset + delta.X,
+                windowStart.Y.Scale,
+                windowStart.Y.Offset + delta.Y
+            )
+            shadow.Position = window.Position + UDim2.fromOffset(5, 7)
+        elseif draggingSlider then
+            setSpeedFromX(input.Position.X)
+        end
+    end))
+    trackHudConnection(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            draggingWindow = false
+            draggingSlider = false
+        end
+    end))
+    trackHudConnection(RunService.RenderStepped:Connect(function()
+        if not title.Parent then
+            return
+        end
+        local phase = (math.sin(os.clock() * 1.8) + 1) * 0.5
+        local neonGreen = Color3.fromRGB(57, 255, 20)
+        local neonBlack = Color3.fromRGB(2, 8, 4)
+        title.TextColor3 = neonGreen:Lerp(neonBlack, phase)
+        title.TextStrokeColor3 = neonBlack:Lerp(neonGreen, phase)
+    end))
+end
+
+local function updateHud()
+    if not hud.screenGui or not hud.screenGui.Parent then
+        return
+    end
+    hud.status.Text = runtime.state
+    hud.values.sessionKills.Text = formatNumber(stats.sessionKills)
+    hud.values.totalKills.Text = formatNumber(stats.totalKills)
+    hud.values.sessionStingers.Text = formatNumber(stats.sessionStingers)
+    hud.values.totalStingers.Text = formatNumber(stats.totalStingers)
+    hud.values.stingersPerHour.Text = formatRate(sessionStingersPerHour())
+    hud.values.searchers.Text = activeSearcherDisplay()
+    hud.lastResult.Text = runtime.lastResult
+    hud.detail.Text = runtime.detail .. "  |  " .. formatDuration(now() - stats.startedAt)
 end
 
 local function setState(state, detail)
