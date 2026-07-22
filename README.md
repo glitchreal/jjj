@@ -223,13 +223,13 @@ firebase deploy --only database
 
 The killer will not report a kill unless it first sees a live Vicious Bee in the claimed `JobId` and then receives a Humanoid death signal or observes health at zero. A disappearance without either signal is a failed job.
 
-While the Vicious Bee is alive, the killer refreshes its baseline from the local player's live `CoreStats.Stingers` value every 0.1 seconds. Once death is confirmed, it freezes that baseline and samples the same value every 0.4 seconds for up to 8 seconds. A positive result can settle early after three identical reads. The calculation is:
+While the Vicious Bee is alive, the killer refreshes its baseline from Bee Swarm's live `ClientStatCache:Get().Eggs.Stinger` value every 0.1 seconds. `CoreStats.Stingers` is retained only as a compatibility fallback because current Bee Swarm clients do not expose that value there. Once death is confirmed, the killer freezes that baseline and samples the same value every 0.4 seconds for up to 8 seconds. A positive result can settle early after three identical reads. The calculation is:
 
 ```text
 stingersGained = max(0, finalStingerCount - stingerCountBeforeKill)
 ```
 
-If either side cannot be read, the job, tracker result, and Discord embed use `Unknown`; lifetime and session stinger totals are not changed. Every attempted after-value and the final result are logged without exposing credentials.
+If either side cannot be read, the job, tracker result, and Discord embed use `Unknown`; lifetime and session stinger totals are not changed. Successful reports include both the gained amount and the before -> after inventory values. Every attempted after-value and the final result are logged without exposing credentials.
 
 ## Tracker and statistics
 
@@ -237,7 +237,9 @@ When `Drawing` is supported, the killer tracker shows session and lifetime kills
 
 Lifetime and active-session values are stored in `vichop_stats.json`. The session ID is passed in teleport data and in the per-account local resume file, so session counters do not reset on every hop. Writes use a temporary file before replacing the main file. Invalid JSON is copied to a timestamped `.corrupt-*.json` backup when file APIs are available, then clean defaults are used.
 
-The Discord outcome uses inline Reward, Session, Lifetime, and Server fields. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
+The Discord outcome uses inline Reward, Inventory, Session, Lifetime, and Server fields. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
+
+After a killer teleport, the script does not resume normal queue polling until it can verify the expected claim in Firebase. Transient Firebase HTTP failures keep the killer in a recovery state. If Roblox routes an exact-instance teleport into a different server, the killer retries the same claimed destination up to three times before marking the job failed; it does not immediately abandon the claim and hop to another job.
 
 ## Executor compatibility
 

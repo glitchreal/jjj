@@ -3,6 +3,7 @@
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TeleportService = game:GetService("TeleportService")
 local StarterGui = game:GetService("StarterGui")
 
@@ -24,6 +25,9 @@ local TERMINAL_RETENTION_SECONDS = 60 * 60
 local HTTP_TIMEOUT_SECONDS = 15
 local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_RETRIES = 3
+local ARRIVAL_COORDINATION_RETRY_SECONDS = 30
+local MAX_WRONG_SERVER_REDIRECTS = 3
+local SESSION_RESUME_MAX_AGE_SECONDS = 20 * 60
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
 
@@ -62,21 +66,40 @@ task.wait(CHARACTER_SETTLE_SECONDS)
 local RESUME_FILE = "vichop_killer_resume_" .. tostring(PLAYER.UserId) .. ".json"
 
 local env = type(getgenv) == "function" and getgenv() or _G
+local function readJsonFile(path)
+    if type(isfile) ~= "function" or type(readfile) ~= "function" or not isfile(path) then
+        return nil
+    end
+    local readOk, raw = pcall(readfile, path)
+    if not readOk or type(raw) ~= "string" then
+        return nil
+    end
+    local decodeOk, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+    return decodeOk and type(decoded) == "table" and decoded or nil
+end
+
 local function getJoinTeleportData()
     local ok, joinData = pcall(PLAYER.GetJoinData, PLAYER)
     if ok and type(joinData) == "table" and type(joinData.TeleportData) == "table"
         and joinData.TeleportData.vichopRole == "killer" then
         return joinData.TeleportData
     end
-    if type(isfile) == "function" and type(readfile) == "function" and isfile(RESUME_FILE) then
-        local readOk, raw = pcall(readfile, RESUME_FILE)
-        local decodeOk, saved = pcall(HttpService.JSONDecode, HttpService, readOk and raw or "")
-        if decodeOk and type(saved) == "table" and saved.vichopRole == "killer"
-            and os.time() - tonumber(saved.savedAt or 0) <= 120 then
-            return saved
-        end
+    local saved = readJsonFile(RESUME_FILE)
+    if type(saved) == "table" and saved.vichopRole == "killer"
+        and os.time() - tonumber(saved.savedAt or 0) <= 120 then
+        return saved
     end
     return {}
+end
+
+local function getRecentStatsSessionId()
+    local saved = readJsonFile(STATS_FILE)
+    local updatedAt = type(saved) == "table" and tonumber(saved.updatedAt or 0) or 0
+    if type(saved) == "table" and type(saved.sessionId) == "string" and saved.sessionId ~= ""
+        and os.time() - updatedAt <= SESSION_RESUME_MAX_AGE_SECONDS then
+        return saved.sessionId
+    end
+    return nil
 end
 
 local joinTeleportData = getJoinTeleportData()
@@ -88,6 +111,7 @@ end
 
 local sessionId = joinTeleportData.vichopRole == "killer" and joinTeleportData.vichopSessionId
     or env.__VICHOP_KILLER_SESSION_ID
+    or getRecentStatsSessionId()
 if type(sessionId) ~= "string" or sessionId == "" then
     sessionId = "killer-" .. tostring(PLAYER.UserId) .. "-" .. HttpService:GenerateGUID(false)
 end
@@ -108,6 +132,8 @@ local runtime = {
     failedJobs = {},
     webhookInFlight = 0,
     cleanupRunning = false,
+    redirectCount = math.max(0, tonumber(joinTeleportData.vichopRedirectCount) or 0),
+    stingerSource = "Unavailable",
 }
 env.__VICHOP_KILLER_RUNTIME = runtime
 
@@ -387,12 +413,42 @@ local function jobPath(key)
     return "/jobs/" .. tostring(key) .. ".json"
 end
 
+local clientStatCache = nil
+local clientStatCacheChecked = false
+local function getClientStatCache()
+    if clientStatCacheChecked then
+        return clientStatCache
+    end
+    clientStatCacheChecked = true
+    local module = ReplicatedStorage:FindFirstChild("ClientStatCache")
+    if module and module:IsA("ModuleScript") then
+        local ok, cache = pcall(require, module)
+        if ok and type(cache) == "table" and type(cache.Get) == "function" then
+            clientStatCache = cache
+        end
+    end
+    return clientStatCache
+end
+
 local function getStingers()
+    local cache = getClientStatCache()
+    if cache then
+        local ok, playerStats = pcall(cache.Get, cache)
+        local eggs = ok and type(playerStats) == "table" and playerStats.Eggs or nil
+        local value = type(eggs) == "table" and tonumber(eggs.Stinger) or nil
+        if value then
+            runtime.stingerSource = "ClientStatCache.Eggs.Stinger"
+            return math.max(0, math.floor(value))
+        end
+    end
+
     local coreStats = PLAYER:FindFirstChild("CoreStats")
     local stingers = coreStats and coreStats:FindFirstChild("Stingers")
     if stingers and (stingers:IsA("IntValue") or stingers:IsA("NumberValue")) then
-        return tonumber(stingers.Value)
+        runtime.stingerSource = "CoreStats.Stingers"
+        return math.max(0, math.floor(tonumber(stingers.Value) or 0))
     end
+    runtime.stingerSource = "Unavailable"
     return nil
 end
 
@@ -498,6 +554,13 @@ local function webhookStingerText(report)
     return "`+" .. formatNumber(report.stingersGained) .. "`"
 end
 
+local function webhookStingerInventoryText(report)
+    if not report.stingersKnown then
+        return "`Unknown`"
+    end
+    return "`" .. formatNumber(report.stingersBefore) .. " -> " .. formatNumber(report.finalStingerCount) .. "`"
+end
+
 local function sendWebhook(report)
     if DISCORD_WEBHOOK_URL == "" then
         return
@@ -517,6 +580,7 @@ local function sendWebhook(report)
                 { name = "Killer", value = "`" .. KILLER_NAME .. "`", inline = true },
                 { name = "Server ID", value = "`" .. shortJobId(report.jobId) .. "`", inline = true },
                 { name = "Stingers gained", value = webhookStingerText(report), inline = true },
+                { name = "Stinger inventory", value = webhookStingerInventoryText(report), inline = true },
                 { name = "Vicious level", value = report.level and ("`" .. tostring(report.level) .. "`") or "`Unknown`", inline = true },
                 { name = "Search / hop", value = "`" .. formatDuration(report.searchDuration) .. "`", inline = true },
                 { name = "Session kills", value = "`" .. formatNumber(stats.sessionKills) .. "`", inline = true },
@@ -651,7 +715,12 @@ local function collectStingerResult(stingersBefore, key)
     local lastAfter = nil
     local stableReads = 0
 
-    print("[Vichop/Killer][Stingers] before =", stingersBefore == nil and "Unknown" or stingersBefore)
+    print(
+        "[Vichop/Killer][Stingers] before =",
+        stingersBefore == nil and "Unknown" or stingersBefore,
+        "source =",
+        runtime.stingerSource
+    )
     while runtime.active and os.clock() <= deadline do
         attempt = attempt + 1
         local after = game.JobId == key and getStingers() or nil
@@ -799,6 +868,8 @@ local function recordConfirmedKill(key, job, level, stingersBefore)
         status = known and "Success" or "Success - reward unknown",
         stingersKnown = known,
         stingersGained = gained,
+        stingersBefore = stingersBefore,
+        finalStingerCount = finalStingers,
         jobId = key,
         level = level or job.viciousLevel,
         searchDuration = (runtime.currentJoinedAt or completedAt) - tonumber(job.createdAt or completedAt),
@@ -966,6 +1037,7 @@ local function writeResumeContext(key, job)
         vichopExpectedJobId = tostring(job.jobId or key),
         vichopClaimKey = tostring(key),
         vichopFromJobId = game.JobId,
+        vichopRedirectCount = runtime.redirectCount,
         savedAt = now(),
     })
     if not encodeOk then
@@ -996,6 +1068,7 @@ local function teleportToClaim(key, job)
             vichopExpectedJobId = tostring(job.jobId or key),
             vichopClaimKey = key,
             vichopFromJobId = game.JobId,
+            vichopRedirectCount = runtime.redirectCount,
             vichopTeleportedAt = now(),
         }
         local ok, err = pcall(function()
@@ -1043,6 +1116,89 @@ local playerTeleportConnection = PLAYER.OnTeleport:Connect(function(state)
     end
 end)
 
+local function getJobWithRetry(key, retrySeconds)
+    local deadline = os.clock() + retrySeconds
+    local attempt = 0
+    while runtime.active and os.clock() < deadline do
+        attempt = attempt + 1
+        local job, readOk = firebaseGet(jobPath(key))
+        if readOk then
+            return job, true
+        end
+        setState("RECOVERING", "Waiting for Firebase claim read (attempt " .. tostring(attempt) .. ")")
+        task.wait(math.min(2, 0.4 + attempt * 0.2))
+    end
+    return nil, false
+end
+
+local function recoverArrivalContext()
+    if joinTeleportData.vichopRole ~= "killer" then
+        return "none"
+    end
+
+    local expectedKey = tostring(joinTeleportData.vichopClaimKey or joinTeleportData.vichopExpectedJobId or "")
+    if expectedKey == "" then
+        return "none"
+    end
+
+    if expectedKey ~= game.JobId then
+        local wrongJob, readOk = getJobWithRetry(expectedKey, ARRIVAL_COORDINATION_RETRY_SECONDS)
+        if not readOk then
+            warn("[Vichop/Killer] Could not verify the claimed destination after arrival; staying put")
+            return "blocked"
+        end
+        if type(wrongJob) ~= "table" or wrongJob.status ~= "claimed" or wrongJob.claimedBy ~= sessionId then
+            warn("[Vichop/Killer] Claimed destination is no longer owned; resuming queue")
+            return "none"
+        end
+
+        if runtime.redirectCount >= MAX_WRONG_SERVER_REDIRECTS then
+            reportFailure(expectedKey, wrongJob, "teleported_into_wrong_server", "Failure - wrong server")
+            return "none"
+        end
+
+        runtime.redirectCount = runtime.redirectCount + 1
+        warn(
+            "[Vichop/Killer] Arrived in the wrong server; retrying exact destination",
+            runtime.redirectCount,
+            "of",
+            MAX_WRONG_SERVER_REDIRECTS
+        )
+        local teleported, teleportError = teleportToClaim(expectedKey, wrongJob)
+        if teleported then
+            return "redirected"
+        end
+        if runtime.active then
+            reportFailure(
+                expectedKey,
+                wrongJob,
+                "teleport_retry_failed: " .. tostring(teleportError),
+                "Failure - teleport"
+            )
+        end
+        return "none"
+    end
+
+    local currentJob, readOk = getJobWithRetry(game.JobId, ARRIVAL_COORDINATION_RETRY_SECONDS)
+    if not readOk then
+        warn("[Vichop/Killer] Could not verify the current claim after arrival; staying put")
+        return "blocked"
+    end
+    if type(currentJob) == "table" and currentJob.status == "claimed" and currentJob.claimedBy == sessionId then
+        handleClaim(game.JobId, currentJob)
+        return "handled"
+    end
+    if type(currentJob) == "table" and currentJob.status == "spawned" then
+        local claimed, _, claimedJob = claimJob(game.JobId)
+        if claimed then
+            handleClaim(game.JobId, claimedJob)
+            return "handled"
+        end
+    end
+    warn("[Vichop/Killer] Expected claim was not present in this server; resuming queue")
+    return "none"
+end
+
 local function runKiller()
     createHud()
     updateHud()
@@ -1055,18 +1211,10 @@ local function runKiller()
 
     print("[Vichop/Killer] Running", KILLER_NAME, "session", sessionId:sub(1, 18), "in", shortJobId(game.JobId))
 
-    if joinTeleportData.vichopRole == "killer" and joinTeleportData.vichopExpectedJobId
-        and tostring(joinTeleportData.vichopExpectedJobId) ~= game.JobId then
-        local wrongKey = tostring(joinTeleportData.vichopClaimKey or joinTeleportData.vichopExpectedJobId)
-        local wrongJob = firebaseGet(jobPath(wrongKey))
-        if type(wrongJob) == "table" and wrongJob.status == "claimed" and wrongJob.claimedBy == sessionId then
-            reportFailure(wrongKey, wrongJob, "teleported_into_wrong_server", "Failure - wrong server")
-        end
-    end
-
-    local currentJob = firebaseGet(jobPath(game.JobId))
-    if type(currentJob) == "table" and currentJob.status == "claimed" and currentJob.claimedBy == sessionId then
-        handleClaim(game.JobId, currentJob)
+    local arrivalState = recoverArrivalContext()
+    while runtime.active and arrivalState == "blocked" do
+        task.wait(1)
+        arrivalState = recoverArrivalContext()
     end
 
     local lastCleanup = 0
@@ -1076,6 +1224,7 @@ local function runKiller()
             local claimed, reason, claimedJob = claimJob(candidate.key)
             if claimed then
                 claimedSomething = true
+                runtime.redirectCount = 0
                 runtime.currentClaimKey = candidate.key
                 runtime.currentJob = claimedJob
                 notify("Vichop found", "Claimed Vicious server " .. shortJobId(candidate.key))
