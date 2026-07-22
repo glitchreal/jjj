@@ -50,8 +50,6 @@ local MAX_HIVE_APPROACH_SPEED = 90
 local HIVE_APPROACH_MAX_SECONDS = 5
 local TRAVEL_MAX_VELOCITY = 145
 local TRAVEL_RESPONSIVENESS = 65
-local TRAVEL_REACHED_DISTANCE = 7
-local TRAVEL_REENTER_DISTANCE = 14
 local ACTIVATION_TOUCH_DISTANCE = 0.75
 local ACTIVATION_DISCOVERY_SECONDS = 2.5
 local ACTIVATION_APPROACH_CLEARANCE = 8
@@ -62,16 +60,18 @@ local ACTIVATION_DROP_MAX_VELOCITY = 35
 local ACTIVATION_DROP_RETRY_SECONDS = 2
 local ACTIVATION_HOLD_SECONDS = 0.15
 local ACTIVATION_TIMEOUT_SECONDS = 8
-local COMBAT_DISTANCE = 5
-local COMBAT_ORBIT_SPEED = 1.65
-local COMBAT_MOVE_INTERVAL = 0.12
 local SPIKE_TRACK_SECONDS = 5
-local SPIKE_DANGER_RADIUS = 6.5
-local OVERHEAD_HEIGHT = 18
+local OVERHEAD_HEIGHT = 10
 local OVERHEAD_PLATFORM_SIZE = Vector3.new(20, 1, 20)
-local OVERHEAD_FOLLOW_SPEED = 10
+local OVERHEAD_FOLLOW_SPEED = 8
+local OVERHEAD_MAX_PLATFORM_STEP = 4
 local OVERHEAD_MAX_CORRECTION_DISTANCE = 5
 local OVERHEAD_SETTLED_DISTANCE = 1.5
+local OVERHEAD_SURFACE_SCAN_HEIGHT = 256
+local OVERHEAD_SURFACE_SCAN_DEPTH = 512
+local OVERHEAD_GEOMETRY_CLEARANCE = 2
+local OVERHEAD_FALLBACK_MAX_VELOCITY = 65
+local OVERHEAD_PLATFORM_RETRY_SECONDS = 1
 local EMERGENCY_REJOIN_RETRY_SECONDS = 2
 
 if game.PlaceId ~= BSS_PLACE_ID then
@@ -864,15 +864,14 @@ local movement = {
     character = nil,
     humanoid = nil,
     overheadPlatform = nil,
-    overheadField = nil,
     activationTarget = nil,
     activationStage = "idle",
     activationStartedAt = 0,
     activationDropStartedAt = 0,
     activationTouchedAt = 0,
     activationTouchConnection = nil,
-    orbitAngle = 0,
-    lastCombatMoveAt = 0,
+    hoverReferenceKind = "vicious",
+    lastPlatformRetryAt = 0,
     originalAutoRotate = nil,
     originalCollisions = {},
     hazards = setmetatable({}, { __mode = "k" }),
@@ -917,30 +916,6 @@ local function activationSweepPositions(activation)
     )
 end
 
-local function positionIsInsideZone(position, zone)
-    if not zone or not zone:IsA("BasePart") then
-        return false
-    end
-    local localPosition = zone.CFrame:PointToObjectSpace(position)
-    return math.abs(localPosition.X) <= zone.Size.X * 0.5
-        and math.abs(localPosition.Z) <= zone.Size.Z * 0.5
-        and math.abs(localPosition.Y) <= 35
-end
-
-local function getOverheadCombatField(position)
-    local zones = workspace:FindFirstChild("FlowerZones")
-    if not zones then
-        return nil
-    end
-    for _, fieldName in ipairs({ "Pepper Patch", "Mountain Top Field" }) do
-        local zone = zones:FindFirstChild(fieldName)
-        if positionIsInsideZone(position, zone) then
-            return fieldName
-        end
-    end
-    return nil
-end
-
 local function createOverheadPlatform(targetPosition)
     local ok, platform = pcall(Instance.new, "Part")
     if not ok or not platform then
@@ -954,7 +929,7 @@ local function createOverheadPlatform(targetPosition)
     platform.CanQuery = false
     platform.Transparency = 1
     platform.CastShadow = false
-    platform.CFrame = CFrame.new(targetPosition + Vector3.new(0, OVERHEAD_HEIGHT, 0))
+    platform.CFrame = CFrame.new(targetPosition)
     local parented = pcall(function()
         platform.Parent = workspace
     end)
@@ -981,8 +956,8 @@ end
 local function enableTravelNoclip(currentCharacter)
     disableTravelNoclip()
     local function apply()
-        if not movement.active or (movement.mode ~= "travel" and movement.mode ~= "activate"
-            and movement.mode ~= "overhead")
+        if not movement.active or (movement.mode ~= "activate" and movement.mode ~= "overhead"
+            and movement.mode ~= "hover")
             or PLAYER.Character ~= currentCharacter then
             return
         end
@@ -1020,7 +995,7 @@ local function observeSpikeCandidate(instance)
         return
     end
     local currentCharacter, _, root = getCharacterParts()
-    if not currentCharacter or instance:IsDescendantOf(currentCharacter)
+    if not currentCharacter or not root or instance:IsDescendantOf(currentCharacter)
         or (movement.target and instance:IsDescendantOf(movement.target)) then
         return
     end
@@ -1043,85 +1018,135 @@ local function observeSpikeCandidate(instance)
     local anonymousParticleSignal = inParticles and distance <= 20 and not instance.CanCollide
         and pointedOrWarningShape and (instance.Anchored or not hasAlignMover)
     if exactAttackSignal or nameSignal or anonymousParticleSignal then
+        local observedPosition = instance.Position
+        if lowerName == "thorn" then
+            observedPosition = Vector3.new(
+                instance.Position.X,
+                instance.Position.Y - instance.Size.Y * 0.5,
+                instance.Position.Z
+            )
+        end
         movement.hazards[instance] = {
             observedAt = os.clock(),
-            dangerRadius = exactAttackSignal and SPIKE_DANGER_RADIUS
-                or (nameSignal and SPIKE_DANGER_RADIUS or SPIKE_DANGER_RADIUS - 1),
+            position = observedPosition,
+            priority = lowerName == "warningdisk" and 3 or (lowerName == "thorn" and 2 or 1),
         }
     end
 end
 
-local function activeSpikeHazards()
-    local result = {}
+local function getActiveSpikePosition()
+    local bestData
     local timestamp = os.clock()
     for instance, data in pairs(movement.hazards) do
         if not instance.Parent or timestamp - data.observedAt > SPIKE_TRACK_SECONDS then
             movement.hazards[instance] = nil
         else
-            table.insert(result, { position = instance.Position, radius = data.dangerRadius })
-        end
-    end
-    return result
-end
-
-local function groundPosition(position, currentCharacter, monster)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { currentCharacter, monster }
-    local hit = workspace:Raycast(position + Vector3.new(0, 16, 0), Vector3.new(0, -48, 0), params)
-    if not hit then
-        return position
-    end
-    local _, humanoid, root = getCharacterParts()
-    local height = humanoid and root and humanoid.HipHeight + root.Size.Y * 0.5 or 3
-    return Vector3.new(position.X, hit.Position.Y + height, position.Z)
-end
-
-local function chooseCombatPosition(targetPosition, currentCharacter, monster, deltaTime)
-    movement.orbitAngle = movement.orbitAngle + COMBAT_ORBIT_SPEED * deltaTime
-    local hazards = activeSpikeHazards()
-    local bestPosition, bestScore
-    for index = 0, 11 do
-        local angle = movement.orbitAngle + index * math.pi / 6
-        local candidate = targetPosition + Vector3.new(math.cos(angle) * COMBAT_DISTANCE, 0, math.sin(angle) * COMBAT_DISTANCE)
-        local score = 100
-        for _, hazard in ipairs(hazards) do
-            local flatDistance = (Vector3.new(candidate.X, 0, candidate.Z)
-                - Vector3.new(hazard.position.X, 0, hazard.position.Z)).Magnitude
-            score = math.min(score, flatDistance - hazard.radius)
-        end
-        score = score - index * 0.08
-        if not bestScore or score > bestScore then
-            bestPosition, bestScore = candidate, score
-        end
-    end
-    return groundPosition(bestPosition, currentCharacter, monster)
-end
-
-local function distanceToSegment2d(point, startPoint, endPoint)
-    local point2d = Vector2.new(point.X, point.Z)
-    local start2d = Vector2.new(startPoint.X, startPoint.Z)
-    local end2d = Vector2.new(endPoint.X, endPoint.Z)
-    local segment = end2d - start2d
-    if segment.Magnitude < 0.01 then
-        return (point2d - start2d).Magnitude
-    end
-    local alpha = math.clamp((point2d - start2d):Dot(segment) / segment:Dot(segment), 0, 1)
-    return (point2d - (start2d + segment * alpha)).Magnitude
-end
-
-local function deflectTravelGoal(goal, currentPosition)
-    for _, hazard in ipairs(activeSpikeHazards()) do
-        if distanceToSegment2d(hazard.position, currentPosition, goal) <= hazard.radius then
-            local away = Vector3.new(goal.X - hazard.position.X, 0, goal.Z - hazard.position.Z)
-            if away.Magnitude < 0.1 then
-                local path = Vector3.new(goal.X - currentPosition.X, 0, goal.Z - currentPosition.Z)
-                away = path.Magnitude > 0.1 and Vector3.new(-path.Z, 0, path.X) or Vector3.new(1, 0, 0)
+            local lowerName = string.lower(instance.Name)
+            if lowerName == "thorn" then
+                data.position = Vector3.new(
+                    instance.Position.X,
+                    instance.Position.Y - instance.Size.Y * 0.5,
+                    instance.Position.Z
+                )
+            else
+                data.position = instance.Position
             end
-            goal = goal + away.Unit * (hazard.radius + 3)
+        end
+        if instance.Parent and timestamp - data.observedAt <= SPIKE_TRACK_SECONDS
+            and (not bestData or data.priority > bestData.priority
+            or (data.priority == bestData.priority and data.observedAt > bestData.observedAt)) then
+            bestData = data
         end
     end
-    return goal
+    return bestData and bestData.position or nil
+end
+
+local function getHoverReferencePosition(targetPosition)
+    local spikePosition = getActiveSpikePosition()
+    if spikePosition then
+        movement.hoverReferenceKind = "spike"
+        return spikePosition
+    end
+    local activation = getViciousActivationSpike()
+    if activation and activation ~= movement.activationTarget then
+        movement.hoverReferenceKind = "spawn"
+        return activation.Position
+    end
+    movement.hoverReferenceKind = "vicious"
+    return targetPosition
+end
+
+local function movementFilter(currentCharacter, monster, platform)
+    local filter = { currentCharacter, monster }
+    local particles = workspace:FindFirstChild("Particles")
+    if particles then
+        table.insert(filter, particles)
+    end
+    if platform then
+        table.insert(filter, platform)
+    end
+    return filter
+end
+
+local function safeOverheadPlatformPosition(referencePosition, currentCharacter, monster, platform)
+    local desiredY = referencePosition.Y + OVERHEAD_HEIGHT
+    local filter = movementFilter(currentCharacter, monster, platform)
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = filter
+    pcall(function()
+        rayParams.RespectCanCollide = true
+    end)
+    local rayOrigin = Vector3.new(
+        referencePosition.X,
+        referencePosition.Y + OVERHEAD_SURFACE_SCAN_HEIGHT,
+        referencePosition.Z
+    )
+    local surface = workspace:Raycast(
+        rayOrigin,
+        Vector3.new(0, -OVERHEAD_SURFACE_SCAN_DEPTH, 0),
+        rayParams
+    )
+    if surface then
+        desiredY = math.max(desiredY, surface.Position.Y + OVERHEAD_HEIGHT)
+    end
+
+    local overlapParams = OverlapParams.new()
+    overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+    overlapParams.FilterDescendantsInstances = filter
+    overlapParams.MaxParts = 50
+    pcall(function()
+        overlapParams.RespectCanCollide = true
+    end)
+    local checkCenter = Vector3.new(referencePosition.X, desiredY + 3, referencePosition.Z)
+    local checkSize = Vector3.new(
+        OVERHEAD_PLATFORM_SIZE.X - 2,
+        8,
+        OVERHEAD_PLATFORM_SIZE.Z - 2
+    )
+    local ok, parts = pcall(workspace.GetPartBoundsInBox, workspace, CFrame.new(checkCenter), checkSize, overlapParams)
+    if ok then
+        for _, part in ipairs(parts) do
+            if part.CanCollide then
+                local highestPoint = part.Position.Y + part.Size.Y * 0.5
+                if highestPoint + OVERHEAD_GEOMETRY_CLEARANCE >= desiredY then
+                    desiredY = highestPoint + OVERHEAD_HEIGHT
+                end
+            end
+        end
+    end
+    return Vector3.new(referencePosition.X, desiredY, referencePosition.Z)
+end
+
+local function smoothPlatformPosition(currentPosition, desiredPosition, deltaTime)
+    local alpha = 1 - math.exp(-OVERHEAD_FOLLOW_SPEED * math.max(deltaTime, 0))
+    local delta = desiredPosition - currentPosition
+    local step = delta * math.clamp(alpha, 0, 1)
+    if step.Magnitude > OVERHEAD_MAX_PLATFORM_STEP then
+        step = step.Unit * OVERHEAD_MAX_PLATFORM_STEP
+    end
+    return currentPosition + step
 end
 
 local function stopMovement(reason)
@@ -1133,6 +1158,7 @@ local function stopMovement(reason)
     movement.activationStartedAt = 0
     movement.activationDropStartedAt = 0
     movement.activationTouchedAt = 0
+    movement.lastPlatformRetryAt = 0
     disableTravelNoclip()
     for _, connectionName in ipairs({ "updateConnection", "hazardConnection", "activationTouchConnection" }) do
         local connection = movement[connectionName]
@@ -1157,7 +1183,7 @@ local function stopMovement(reason)
     end
     movement.character = nil
     movement.humanoid = nil
-    movement.overheadField = nil
+    movement.hoverReferenceKind = "vicious"
     movement.originalAutoRotate = nil
     table.clear(movement.hazards)
     if reason then
@@ -1191,8 +1217,7 @@ local function enterActivationMode(currentCharacter, humanoid, activationTarget)
     print("[Vichop/Killer] Approaching above Vicious activation spike")
 end
 
-local function enterTravelMode(currentCharacter, humanoid)
-    movement.mode = "travel"
+local function clearActivationTracking()
     movement.activationTarget = nil
     movement.activationStage = "idle"
     movement.activationDropStartedAt = 0
@@ -1200,39 +1225,38 @@ local function enterTravelMode(currentCharacter, humanoid)
         movement.activationTouchConnection:Disconnect()
         movement.activationTouchConnection = nil
     end
+end
+
+local function enterOverheadMode(currentCharacter, humanoid, targetPosition, monster)
+    clearActivationTracking()
     humanoid.AutoRotate = false
+    humanoid:Move(Vector3.zero)
     movement.alignPosition.Enabled = true
-    movement.alignPosition.MaxVelocity = TRAVEL_MAX_VELOCITY
-    movement.alignPosition.Responsiveness = TRAVEL_RESPONSIVENESS
-    movement.alignOrientation.Enabled = true
-    enableTravelNoclip(currentCharacter)
-end
-
-local function enterCombatMode(humanoid)
-    movement.mode = "combat"
-    movement.alignPosition.Enabled = false
+    movement.alignPosition.MaxVelocity = OVERHEAD_FALLBACK_MAX_VELOCITY
+    movement.alignPosition.Responsiveness = 24
     movement.alignOrientation.Enabled = false
-    disableTravelNoclip()
-    humanoid.AutoRotate = true
-    movement.lastCombatMoveAt = 0
-end
+    enableTravelNoclip(currentCharacter)
 
-local function enterOverheadMode(currentCharacter, humanoid, targetPosition)
-    local platform = createOverheadPlatform(targetPosition)
+    local referencePosition = getHoverReferencePosition(targetPosition)
+    local safePosition = safeOverheadPlatformPosition(
+        referencePosition,
+        currentCharacter,
+        monster,
+        movement.overheadPlatform
+    )
+    local platform = createOverheadPlatform(safePosition)
     if not platform then
-        warn("[Vichop/Killer] Overhead platform unavailable; using ground combat fallback")
-        enterCombatMode(humanoid)
+        movement.mode = "hover"
+        local _, _, root = getCharacterParts()
+        local standingHeight = humanoid.HipHeight + (root and root.Size.Y * 0.5 or 1)
+        movement.alignPosition.Position = safePosition + Vector3.new(0, standingHeight, 0)
+        warn("[Vichop/Killer] Platform creation failed; using safe overhead hover fallback")
         return false
     end
     movement.mode = "overhead"
     movement.overheadPlatform = platform
-    movement.alignPosition.Enabled = true
-    movement.alignPosition.MaxVelocity = 55
-    movement.alignPosition.Responsiveness = 20
-    movement.alignOrientation.Enabled = false
-    humanoid.AutoRotate = true
-    enableTravelNoclip(currentCharacter)
-    print("[Vichop/Killer] Overhead platform active in", movement.overheadField)
+    movement.lastPlatformRetryAt = 0
+    print("[Vichop/Killer] Universal overhead platform active above", movement.hoverReferenceKind)
     return true
 end
 
@@ -1248,8 +1272,6 @@ local function startMovement(monster)
     movement.target = monster
     movement.character = currentCharacter
     movement.humanoid = humanoid
-    movement.overheadField = getOverheadCombatField(monsterRoot.Position)
-    movement.orbitAngle = math.atan2(root.Position.Z - monsterRoot.Position.Z, root.Position.X - monsterRoot.Position.X)
     movement.originalAutoRotate = humanoid.AutoRotate
 
     local attachment = Instance.new("Attachment")
@@ -1292,7 +1314,7 @@ local function startMovement(monster)
         enterActivationMode(currentCharacter, humanoid, activationTarget)
     else
         print("[Vichop/Killer] No activation spike present; Vicious appears to be active already")
-        enterTravelMode(currentCharacter, humanoid)
+        enterOverheadMode(currentCharacter, humanoid, monsterRoot.Position, monster)
     end
     local particles = workspace:FindFirstChild("Particles")
     if particles then
@@ -1316,12 +1338,10 @@ local function startMovement(monster)
         end
 
         local targetPosition = activeMonsterRoot.Position
-        local flatDistance = (Vector3.new(activeRoot.Position.X, 0, activeRoot.Position.Z)
-            - Vector3.new(targetPosition.X, 0, targetPosition.Z)).Magnitude
         if movement.mode == "activate" then
             local activation = movement.activationTarget
             if not activation or not activation.Parent then
-                enterTravelMode(activeCharacter, activeHumanoid)
+                enterOverheadMode(activeCharacter, activeHumanoid, targetPosition, monster)
                 return
             end
 
@@ -1330,7 +1350,7 @@ local function startMovement(monster)
             if movement.activationTouchedAt > 0 then
                 if timestamp - movement.activationTouchedAt >= ACTIVATION_HOLD_SECONDS then
                     print("[Vichop/Killer] Vicious activation spike touched; moving to combat")
-                    enterTravelMode(activeCharacter, activeHumanoid)
+                    enterOverheadMode(activeCharacter, activeHumanoid, targetPosition, monster)
                 end
                 return
             end
@@ -1341,7 +1361,7 @@ local function startMovement(monster)
                     pcall(firetouchinterest, activeRoot, activation, 0)
                     pcall(firetouchinterest, activeRoot, activation, 1)
                 end
-                enterTravelMode(activeCharacter, activeHumanoid)
+                enterOverheadMode(activeCharacter, activeHumanoid, targetPosition, monster)
                 return
             end
 
@@ -1380,64 +1400,66 @@ local function startMovement(monster)
             if (activeRoot.Position - flatActivationPosition).Magnitude > 0.1 then
                 movement.alignOrientation.CFrame = CFrame.lookAt(activeRoot.Position, flatActivationPosition)
             end
-        elseif movement.mode == "travel" then
-            local direction = Vector3.new(activeRoot.Position.X - targetPosition.X, 0, activeRoot.Position.Z - targetPosition.Z)
-            if direction.Magnitude < 0.1 then
-                direction = Vector3.new(1, 0, 0)
-            else
-                direction = direction.Unit
-            end
-            local travelGoal = targetPosition + direction * COMBAT_DISTANCE
-            movement.alignPosition.Position = deflectTravelGoal(travelGoal, activeRoot.Position)
-            if (activeRoot.Position - targetPosition).Magnitude > 0.1 then
-                movement.alignOrientation.CFrame = CFrame.lookAt(activeRoot.Position, targetPosition)
-            end
-            if flatDistance <= TRAVEL_REACHED_DISTANCE then
-                if movement.overheadField then
-                    enterOverheadMode(activeCharacter, activeHumanoid, targetPosition)
-                else
-                    enterCombatMode(activeHumanoid)
-                end
-            end
-        elseif movement.mode == "overhead" then
+        elseif movement.mode == "overhead" or movement.mode == "hover" then
+            local referencePosition = getHoverReferencePosition(targetPosition)
+            local safePosition = safeOverheadPlatformPosition(
+                referencePosition,
+                activeCharacter,
+                monster,
+                movement.overheadPlatform
+            )
             local platform = movement.overheadPlatform
-            if not platform or not platform.Parent then
-                warn("[Vichop/Killer] Overhead platform was removed; using ground combat fallback")
-                enterCombatMode(activeHumanoid)
-                return
+            if movement.mode == "hover" and os.clock() - movement.lastPlatformRetryAt
+                >= OVERHEAD_PLATFORM_RETRY_SECONDS then
+                movement.lastPlatformRetryAt = os.clock()
+                platform = createOverheadPlatform(safePosition)
+                if platform then
+                    movement.overheadPlatform = platform
+                    movement.mode = "overhead"
+                    print("[Vichop/Killer] Overhead platform recovered")
+                end
+            elseif movement.mode == "overhead" and (not platform or not platform.Parent) then
+                movement.overheadPlatform = nil
+                movement.mode = "hover"
+                movement.lastPlatformRetryAt = 0
+                warn("[Vichop/Killer] Overhead platform was removed; using safe hover fallback")
+                platform = nil
             end
-            local desiredPlatform = CFrame.new(targetPosition + Vector3.new(0, OVERHEAD_HEIGHT, 0))
-            local followAlpha = 1 - math.exp(-OVERHEAD_FOLLOW_SPEED * math.max(deltaTime, 0))
-            platform.CFrame = platform.CFrame:Lerp(desiredPlatform, math.clamp(followAlpha, 0, 1))
 
-            local standingHeight = platform.Size.Y * 0.5 + activeHumanoid.HipHeight + activeRoot.Size.Y * 0.5
-            local standingPosition = platform.Position + Vector3.new(0, standingHeight, 0)
-            local horizontalError = (Vector3.new(activeRoot.Position.X, 0, activeRoot.Position.Z)
-                - Vector3.new(platform.Position.X, 0, platform.Position.Z)).Magnitude
-            local verticalError = math.abs(activeRoot.Position.Y - standingPosition.Y)
-            if horizontalError > OVERHEAD_MAX_CORRECTION_DISTANCE
-                or verticalError > OVERHEAD_MAX_CORRECTION_DISTANCE then
+            if platform then
+                platform.Position = smoothPlatformPosition(platform.Position, safePosition, deltaTime)
+                local standingHeight = platform.Size.Y * 0.5 + activeHumanoid.HipHeight
+                    + activeRoot.Size.Y * 0.5
+                local standingPosition = platform.Position + Vector3.new(0, standingHeight, 0)
+                local horizontalError = (Vector3.new(activeRoot.Position.X, 0, activeRoot.Position.Z)
+                    - Vector3.new(platform.Position.X, 0, platform.Position.Z)).Magnitude
+                local verticalError = math.abs(activeRoot.Position.Y - standingPosition.Y)
+                if horizontalError > OVERHEAD_MAX_CORRECTION_DISTANCE
+                    or verticalError > OVERHEAD_MAX_CORRECTION_DISTANCE then
+                    movement.alignPosition.Enabled = true
+                    movement.alignPosition.Position = standingPosition
+                    activeHumanoid.AutoRotate = false
+                    if not movement.noclipConnection then
+                        enableTravelNoclip(activeCharacter)
+                    end
+                elseif horizontalError <= OVERHEAD_SETTLED_DISTANCE
+                    and verticalError <= OVERHEAD_SETTLED_DISTANCE then
+                    movement.alignPosition.Enabled = false
+                    disableTravelNoclip()
+                    activeHumanoid.AutoRotate = true
+                end
+            else
                 movement.alignPosition.Enabled = true
-                movement.alignPosition.Position = standingPosition
+                movement.alignPosition.MaxVelocity = OVERHEAD_FALLBACK_MAX_VELOCITY
+                movement.alignPosition.Position = safePosition + Vector3.new(
+                    0,
+                    activeHumanoid.HipHeight + activeRoot.Size.Y * 0.5,
+                    0
+                )
+                activeHumanoid.AutoRotate = false
                 if not movement.noclipConnection then
                     enableTravelNoclip(activeCharacter)
                 end
-            elseif horizontalError <= OVERHEAD_SETTLED_DISTANCE
-                and verticalError <= OVERHEAD_SETTLED_DISTANCE then
-                movement.alignPosition.Enabled = false
-                disableTravelNoclip()
-            end
-        else
-            if flatDistance >= TRAVEL_REENTER_DISTANCE then
-                enterTravelMode(activeCharacter, activeHumanoid)
-                return
-            end
-            if os.clock() - movement.lastCombatMoveAt >= COMBAT_MOVE_INTERVAL then
-                local timestamp = os.clock()
-                local elapsed = movement.lastCombatMoveAt > 0 and timestamp - movement.lastCombatMoveAt
-                    or COMBAT_MOVE_INTERVAL
-                movement.lastCombatMoveAt = timestamp
-                activeHumanoid:MoveTo(chooseCombatPosition(targetPosition, activeCharacter, monster, elapsed))
             end
         end
     end)
