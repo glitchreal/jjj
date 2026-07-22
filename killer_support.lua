@@ -26,7 +26,9 @@ local CLEANUP_INTERVAL_SECONDS = 30
 local TERMINAL_RETENTION_SECONDS = 60 * 60
 local HTTP_TIMEOUT_SECONDS = 15
 local TELEPORT_TIMEOUT_SECONDS = 7
-local TELEPORT_RETRIES = 3
+local TELEPORT_RETRIES = 5
+local SLOT_HANDOFF_TIMEOUT_SECONDS = 30
+local SLOT_HANDOFF_POLL_SECONDS = 0.5
 local ARRIVAL_COORDINATION_RETRY_SECONDS = 30
 local MAX_WRONG_SERVER_REDIRECTS = 3
 local SESSION_RESUME_MAX_AGE_SECONDS = 20 * 60
@@ -43,6 +45,9 @@ local TRAVEL_MAX_VELOCITY = 145
 local TRAVEL_RESPONSIVENESS = 65
 local TRAVEL_REACHED_DISTANCE = 7
 local TRAVEL_REENTER_DISTANCE = 14
+local ACTIVATION_TOUCH_DISTANCE = 2.5
+local ACTIVATION_HOLD_SECONDS = 0.45
+local ACTIVATION_TIMEOUT_SECONDS = 8
 local COMBAT_DISTANCE = 5
 local COMBAT_ORBIT_SPEED = 1.65
 local COMBAT_MOVE_INTERVAL = 0.12
@@ -752,6 +757,9 @@ local movement = {
     updateConnection = nil,
     hazardConnection = nil,
     noclipConnection = nil,
+    activationTarget = nil,
+    activationStartedAt = 0,
+    activationTouchedAt = 0,
     orbitAngle = 0,
     lastCombatMoveAt = 0,
     originalAutoRotate = nil,
@@ -765,6 +773,12 @@ local function getMonsterRoot(monster)
     end
     return monster:FindFirstChild("HumanoidRootPart") or monster.PrimaryPart
         or monster:FindFirstChild("Torso") or monster:FindFirstChild("Head")
+end
+
+local function getViciousActivationSpike()
+    local particles = workspace:FindFirstChild("Particles")
+    local activation = particles and particles:FindFirstChild("Vicious")
+    return activation and activation:IsA("BasePart") and activation or nil
 end
 
 local function disableTravelNoclip()
@@ -783,7 +797,8 @@ end
 local function enableTravelNoclip(currentCharacter)
     disableTravelNoclip()
     local function apply()
-        if not movement.active or movement.mode ~= "travel" or PLAYER.Character ~= currentCharacter then
+        if not movement.active or (movement.mode ~= "travel" and movement.mode ~= "activate")
+            or PLAYER.Character ~= currentCharacter then
             return
         end
         for _, descendant in ipairs(currentCharacter:GetDescendants()) do
@@ -928,6 +943,9 @@ local function stopMovement(reason)
     movement.active = false
     movement.mode = "idle"
     movement.target = nil
+    movement.activationTarget = nil
+    movement.activationStartedAt = 0
+    movement.activationTouchedAt = 0
     disableTravelNoclip()
     for _, connectionName in ipairs({ "updateConnection", "hazardConnection" }) do
         local connection = movement[connectionName]
@@ -958,8 +976,21 @@ local function stopMovement(reason)
 end
 runtime.stopMovement = stopMovement
 
+local function enterActivationMode(currentCharacter, humanoid, activationTarget)
+    movement.mode = "activate"
+    movement.activationTarget = activationTarget
+    movement.activationStartedAt = os.clock()
+    movement.activationTouchedAt = 0
+    humanoid.AutoRotate = false
+    movement.alignPosition.Enabled = true
+    movement.alignOrientation.Enabled = true
+    enableTravelNoclip(currentCharacter)
+    print("[Vichop/Killer] Touching Vicious activation spike")
+end
+
 local function enterTravelMode(currentCharacter, humanoid)
     movement.mode = "travel"
+    movement.activationTarget = nil
     humanoid.AutoRotate = false
     movement.alignPosition.Enabled = true
     movement.alignOrientation.Enabled = true
@@ -1015,7 +1046,12 @@ local function startMovement(monster)
     alignOrientation.Parent = root
     movement.alignOrientation = alignOrientation
 
-    enterTravelMode(currentCharacter, humanoid)
+    local activationTarget = getViciousActivationSpike()
+    if activationTarget then
+        enterActivationMode(currentCharacter, humanoid, activationTarget)
+    else
+        enterTravelMode(currentCharacter, humanoid)
+    end
     local particles = workspace:FindFirstChild("Particles")
     if particles then
         for _, instance in ipairs(particles:GetDescendants()) do
@@ -1039,7 +1075,32 @@ local function startMovement(monster)
         local targetPosition = activeMonsterRoot.Position
         local flatDistance = (Vector3.new(activeRoot.Position.X, 0, activeRoot.Position.Z)
             - Vector3.new(targetPosition.X, 0, targetPosition.Z)).Magnitude
-        if movement.mode == "travel" then
+        if movement.mode == "activate" then
+            local activation = movement.activationTarget
+            if not activation or not activation.Parent
+                or os.clock() - movement.activationStartedAt >= ACTIVATION_TIMEOUT_SECONDS then
+                enterTravelMode(activeCharacter, activeHumanoid)
+                return
+            end
+            movement.alignPosition.Position = activation.Position
+            if (activeRoot.Position - activation.Position).Magnitude > 0.1 then
+                movement.alignOrientation.CFrame = CFrame.lookAt(activeRoot.Position, activation.Position)
+            end
+            if (activeRoot.Position - activation.Position).Magnitude <= ACTIVATION_TOUCH_DISTANCE then
+                if movement.activationTouchedAt == 0 then
+                    movement.activationTouchedAt = os.clock()
+                    if type(firetouchinterest) == "function" then
+                        pcall(firetouchinterest, activeRoot, activation, 0)
+                        pcall(firetouchinterest, activeRoot, activation, 1)
+                    end
+                elseif os.clock() - movement.activationTouchedAt >= ACTIVATION_HOLD_SECONDS then
+                    print("[Vichop/Killer] Vicious activation spike touched; entering combat")
+                    enterTravelMode(activeCharacter, activeHumanoid)
+                end
+            else
+                movement.activationTouchedAt = 0
+            end
+        elseif movement.mode == "travel" then
             local direction = Vector3.new(activeRoot.Position.X - targetPosition.X, 0, activeRoot.Position.Z - targetPosition.Z)
             if direction.Magnitude < 0.1 then
                 direction = Vector3.new(1, 0, 0)
@@ -1651,10 +1712,44 @@ local function writeResumeContext(key, job)
     return writeOk
 end
 
+local function waitForSearcherSlot(key, job)
+    if job.searcherDeparting ~= true then
+        return true, job
+    end
+
+    local deadline = os.clock() + SLOT_HANDOFF_TIMEOUT_SECONDS
+    local current = job
+    setState("WAITING_SLOT", "Searcher is releasing " .. shortJobId(key))
+    while runtime.active and os.clock() < deadline do
+        if now() - runtime.lastClaimHeartbeat >= CLAIM_HEARTBEAT_SECONDS and not heartbeatClaim(key) then
+            return false, current, "claim lease lost while waiting for searcher slot"
+        end
+
+        local latest, readOk = firebaseGet(jobPath(key))
+        if readOk and type(latest) == "table" then
+            current = latest
+            if current.status ~= "claimed" or current.claimedBy ~= sessionId then
+                return false, current, "claim ownership lost while waiting for searcher slot"
+            end
+            local slotReadyAt = tonumber(current.slotReadyAt or 0) or 0
+            if slotReadyAt > 0 and now() >= slotReadyAt then
+                return true, current
+            end
+        end
+        task.wait(SLOT_HANDOFF_POLL_SECONDS)
+    end
+    return false, current, "searcher slot handoff timed out"
+end
+
 local function teleportToClaim(key, job)
     for attempt = 1, TELEPORT_RETRIES do
         if not heartbeatClaim(key) then
             return false, "claim lease lost before teleport"
+        end
+        local slotReady, refreshedJob, slotError = waitForSearcherSlot(key, job)
+        job = refreshedJob or job
+        if not slotReady then
+            return false, slotError
         end
         runtime.teleportStarted = false
         runtime.teleportError = nil

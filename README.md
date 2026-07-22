@@ -202,7 +202,9 @@ Reservations and killer claims use Firebase REST ETags with `if-match`. This com
 
 ## Searcher matchmaking
 
-The searcher prepares a different destination during the five-second scan. Its only normal hop call is:
+The searcher prepares a different destination during the five-second scan. When it detects a live Vicious Bee, it first publishes the Firebase job and immediately starts hopping to its already-prepared different server instead of occupying the Vicious server. Immediately before the teleport call it writes `slotReleaseInitiatedAt` and a three-second `slotReadyAt` grace deadline. The killer may atomically claim the job at once, but waits for that deadline before joining the exact server, preserving the claim while the searcher's player slot is released. If publishing fails, the searcher stays and retries so a live job is never discarded silently.
+
+Its only normal hop call is:
 
 ```lua
 TeleportService:TeleportToPlaceInstance(
@@ -222,13 +224,13 @@ At the no-Vicious decision, the controller freezes new background work and drain
 
 Destination preparation uses a generation guard and a 45-second watchdog. If a Firebase or executor transport call leaves one preparation generation stalled, the searcher retires that generation and starts a new one automatically instead of requiring the support script to be executed again.
 
-The killer remains different by design: it must claim and explicitly join the exact `JobId` containing the detected Vicious Bee.
+The killer remains different by design: it must claim and explicitly join the exact `JobId` containing the detected Vicious Bee. A failed first join does not abandon the claim; the killer refreshes the lease and handoff state and retries that same exact `JobId` up to five times.
 
 ## Killer hive and combat movement
 
 The killer claims a hive after its character finishes loading. It inspects `Workspace.HivePlatforms`, follows each platform's `Hive` ObjectValue to the corresponding `Workspace.Honeycombs` model, and treats a platform as available only when both `PlayerRef` and the Honeycomb's `Owner` are empty and its phase is `Idle`. The character Tweens to the nearest available platform, occupancy is checked again, and then `ReplicatedStorage.Events.ClaimHive` is fired with that Honeycomb's `HiveID`. Claim verification is bounded so a missing or contested hive cannot prevent the killer from handling a Vicious job.
 
-After a claimed server is validated and a living Vicious Bee is confirmed, the killer creates one `AlignPosition` and one `AlignOrientation` on HumanoidRootPart. Travel uses temporary noclip and continually follows the monster's HumanoidRootPart. At combat range, the constraints and noclip are disabled and the Humanoid walks around the target at about five studs. If the Vicious Bee moves more than 14 studs away, AlignPosition travel resumes.
+After a claimed server is validated and a living Vicious Bee is confirmed, the killer creates one `AlignPosition` and one `AlignOrientation` on HumanoidRootPart. If `Workspace.Particles.Vicious` exists, an activation phase first drives HumanoidRootPart directly into that part and holds physical contact briefly so Bee Swarm starts the fight. It then follows the monster's HumanoidRootPart with temporary travel noclip. At combat range, the constraints and noclip are disabled and the Humanoid walks around the target at about five studs. If the Vicious Bee moves more than 14 studs away, AlignPosition travel resumes.
 
 Live inspection found the Vicious definition at `ReplicatedStorage.MonsterTypes.Vicious Bee`, with a 4.5-stud attack radius, three-second aiming period, and four-second attack delay. A live level-six fight confirmed that attacks create paired, top-level `Workspace.Particles.Thorn` and `Workspace.Particles.WarningDisk` parts at matching horizontal positions. The Thorn is anchored, non-collidable, initially transparent, approximately `2.44 x 22.32 x 2.44`, and uses mesh `1033714`; its warning disk is anchored, non-collidable, approximately `10 x 0.4 x 10`, and supplies the five-stud visual danger radius. Cosmetic Thorn parts under `Workspace.Particles.Vicious` belong to the Bee's visual body and are explicitly excluded.
 

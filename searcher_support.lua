@@ -41,6 +41,7 @@ local CLEANUP_INTERVAL_SECONDS = 30
 local HTTP_TIMEOUT_SECONDS = 15
 local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_BACKOFF_MAX_SECONDS = 3
+local KILLER_SLOT_RELEASE_GRACE_SECONDS = 3
 local CANDIDATE_TTL_SECONDS = 3 * 60
 local CANDIDATE_POOL_TARGET = 35
 local CANDIDATE_POOL_MAX = 120
@@ -1145,6 +1146,9 @@ local function publishSpawn(monster, level)
             updated.lastSeenAt = timestamp
             updated.updatedAt = timestamp
             updated.note = monster:GetFullName()
+            updated.searcherDeparting = true
+            updated.searcherDepartureRequestedAt = tonumber(updated.searcherDepartureRequestedAt) or timestamp
+            updated.slotReadyAt = tonumber(updated.slotReadyAt) or 0
             if level then
                 updated.viciousLevel = level
             end
@@ -1166,12 +1170,41 @@ local function publishSpawn(monster, level)
             searcherId = SEARCHER_ID,
             note = monster:GetFullName(),
             viciousLevel = level,
+            searcherDeparting = true,
+            searcherDepartureRequestedAt = timestamp,
+            slotReadyAt = 0,
         }, "spawned"
     end)
     if ok then
         currentJobEventId = tostring(saved.eventId or eventId)
         lastJobHeartbeat = timestamp
         print("[Vichop/Searcher] Published live Vicious job", shortJobId(game.JobId), reason)
+    end
+    return ok
+end
+
+local function scheduleSlotRelease()
+    if not currentJobEventId then
+        return true
+    end
+    local timestamp = now()
+    local ok, reason = atomicMutate(jobPath(game.JobId), function(current)
+        if type(current) ~= "table" or tostring(current.eventId or "") ~= tostring(currentJobEventId) then
+            return nil, "job_replaced"
+        end
+        if current.status ~= "spawned" and current.status ~= "claimed" and current.status ~= "resolving" then
+            return nil, "terminal"
+        end
+        local updated = copyTable(current)
+        updated.searcherDeparting = true
+        updated.searcherDepartureRequestedAt = tonumber(updated.searcherDepartureRequestedAt) or timestamp
+        updated.slotReleaseInitiatedAt = timestamp
+        updated.slotReadyAt = timestamp + KILLER_SLOT_RELEASE_GRACE_SECONDS
+        updated.updatedAt = timestamp
+        return updated, "slot_release_scheduled"
+    end, 3)
+    if not ok then
+        warn("[Vichop/Searcher] Could not schedule killer slot handoff:", tostring(reason))
     end
     return ok
 end
@@ -1226,6 +1259,10 @@ local function teleportToPreparedServer(prepared, reason, requestedAt, attempt)
     runtime.teleportError = nil
     runtime.teleportStarted = false
     runtime.expectedJobId = prepared.jobId
+
+    if not scheduleSlotRelease() then
+        return false, "killer slot handoff update failed"
+    end
 
     writeResumeContext(game.JobId, prepared.jobId, prepared, requestedAt)
     local callLatency = os.clock() - requestedAt
@@ -1639,9 +1676,14 @@ local function runSearcher()
             local monster, level = getVicious()
             if monster then
                 if not lastVicious then
-                    runtime.holdPosition = true
-                    releasePreparedDestination()
-                    publishSpawn(monster, level)
+                    runtime.holdPosition = false
+                    if publishSpawn(monster, level) then
+                        lastVicious = monster
+                        print("[Vichop/Searcher] Vicious published; hopping now to release the killer slot")
+                        requestHop("Vicious published; releasing slot for killer")
+                    else
+                        warn("[Vichop/Searcher] Vicious publish failed; retaining server and retrying")
+                    end
                 elseif now() - lastJobHeartbeat >= HEARTBEAT_SECONDS then
                     heartbeatJob(monster, level)
                 end
@@ -1656,7 +1698,9 @@ local function runSearcher()
             elseif os.clock() - serverStartedAtClock >= INITIAL_SCAN_SECONDS then
                 requestHop("no live Vicious found")
             end
-            lastVicious = monster
+            if not monster then
+                lastVicious = nil
+            end
 
             if now() - lastCleanup >= CLEANUP_INTERVAL_SECONDS then
                 lastCleanup = now()
