@@ -2,6 +2,8 @@
 -- and moves on as soon as the current server is no longer useful.
 
 local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+local GuiService = game:GetService("GuiService")
 local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
 local SoundService = game:GetService("SoundService")
@@ -56,6 +58,7 @@ local MONSTERS_READY_TIMEOUT_SECONDS = 15
 local ANTILAG_INITIAL_BATCH_SIZE = 600
 local ANTILAG_ADDED_BATCH_SIZE = 100
 local ANTILAG_HEALTH_HOP_INTERVAL = 10
+local EMERGENCY_REJOIN_RETRY_SECONDS = 2
 
 if game.PlaceId ~= BSS_PLACE_ID then
     return
@@ -144,6 +147,9 @@ local runtime = {
     sameServerCount = 0,
     httpTimeoutCount = 0,
     crashCount = 0,
+    emergencyRejoinActive = false,
+    statusGui = nil,
+    tutorialConnection = nil,
     antiLag = {
         mode = ANTILAG_MODE,
         processed = 0,
@@ -176,6 +182,72 @@ local serverStartedAtClock = os.clock()
 
 local function now()
     return os.time()
+end
+
+local function hideTutorialUi(instance)
+    if not instance then
+        return
+    end
+    if (instance.Name == "Tutorial" or instance.Name == "TutorialButton") and instance:IsA("GuiObject") then
+        instance.Visible = false
+    end
+end
+
+local function installSearcherUi()
+    local playerGui = PLAYER:FindFirstChildOfClass("PlayerGui") or PLAYER:WaitForChild("PlayerGui", 5)
+    if not playerGui then
+        return
+    end
+    for _, descendant in ipairs(playerGui:GetDescendants()) do
+        hideTutorialUi(descendant)
+    end
+    runtime.tutorialConnection = playerGui.DescendantAdded:Connect(function(descendant)
+        task.defer(hideTutorialUi, descendant)
+    end)
+
+    local old = playerGui:FindFirstChild("VichopSearcherStatus")
+    if old then
+        old:Destroy()
+    end
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "VichopSearcherStatus"
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder = 1000
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Status"
+    label.AnchorPoint = Vector2.new(0.5, 0.5)
+    label.Position = UDim2.fromScale(0.5, 0.5)
+    label.Size = UDim2.fromOffset(260, 74)
+    label.BackgroundColor3 = Color3.fromRGB(255, 220, 55)
+    label.BackgroundTransparency = 0.08
+    label.BorderSizePixel = 0
+    label.Text = "Hopping"
+    label.TextColor3 = Color3.fromRGB(18, 20, 22)
+    label.TextStrokeColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextStrokeTransparency = 0.55
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 32
+    label.Parent = screenGui
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(18, 20, 22)
+    stroke.Thickness = 3
+    stroke.Parent = label
+
+    screenGui.Parent = playerGui
+    runtime.statusGui = screenGui
+end
+
+local function setSearcherStatus(status)
+    local label = runtime.statusGui and runtime.statusGui:FindFirstChild("Status")
+    if not label then
+        return
+    end
+    local spawned = status == "Spawned"
+    label.Text = spawned and "Spawned" or "Hopping"
+    label.BackgroundColor3 = spawned and Color3.fromRGB(57, 255, 20) or Color3.fromRGB(255, 220, 55)
 end
 
 local function readResumeContext()
@@ -1422,6 +1494,15 @@ local function validateArrivedServer(teleportContext)
             or teleportContext.fromJobId or "") or ""
     local expectedJobId = type(teleportContext) == "table"
         and tostring(teleportContext.vichopExpectedJobId or teleportContext.expectedJobId or "") or ""
+    if type(teleportContext) == "table" and teleportContext.vichopEmergencyRejoin == true
+        and expectedJobId == game.JobId then
+        local reserved, reserveReason = reserveServer(game.JobId)
+        if not reserved then
+            return false, "emergency reservation rejected: " .. tostring(reserveReason)
+        end
+        runtime.currentReservationOwned = true
+        return true, "emergency same-server rejoin reserved"
+    end
     if previousJobId ~= "" and previousJobId == game.JobId then
         return false, "explicit teleport returned the previous server"
     end
@@ -1576,6 +1657,106 @@ if teleportDataOnJoin.vichopRole == "searcher" then
     ))
 end
 
+local function activateCoreRetryButton()
+    local ok, activated = pcall(function()
+        for _, descendant in ipairs(CoreGui:GetDescendants()) do
+            if descendant:IsA("TextButton") and descendant.Visible then
+                local text = string.lower(descendant.Text or "")
+                if text == "retry" or text == "rejoin" then
+                    if type(firesignal) == "function" then
+                        pcall(firesignal, descendant.Activated)
+                        pcall(firesignal, descendant.MouseButton1Click)
+                    else
+                        pcall(descendant.Activate, descendant)
+                    end
+                    return true
+                end
+            end
+        end
+        return false
+    end)
+    return ok and activated == true
+end
+
+local function writeEmergencyResumeContext()
+    if type(writefile) ~= "function" then
+        return false
+    end
+    local encodeOk, encoded = pcall(HttpService.JSONEncode, HttpService, {
+        vichopRole = "searcher",
+        vichopSearcherId = SEARCHER_ID,
+        searcherId = SEARCHER_ID,
+        vichopPreviousJobId = game.JobId,
+        vichopFromJobId = game.JobId,
+        vichopExpectedJobId = game.JobId,
+        expectedJobId = game.JobId,
+        vichopEmergencyRejoin = true,
+        antiLagHopCount = runtime.hopCount,
+        successfulHopCount = runtime.successfulHopCount,
+        sameServerCount = runtime.sameServerCount,
+        httpTimeoutCount = runtime.httpTimeoutCount,
+        crashCount = runtime.crashCount,
+        savedAt = now(),
+    })
+    return encodeOk and pcall(writefile, RESUME_FILE, encoded)
+end
+
+local function beginEmergencyRejoin(errorMessage)
+    if runtime.emergencyRejoinActive or runtime.teleportStarted or not runtimeIsCurrent() then
+        return
+    end
+    runtime.emergencyRejoinActive = true
+    runtime.hopping = true
+    runtime.stopBackground = true
+    runtime.nextHop = nil
+    warn("[Vichop/Searcher] Connection error detected; rejoining exact JobId:", tostring(errorMessage))
+    task.spawn(function()
+        local attempt = 0
+        while runtimeIsCurrent() and not runtime.teleportStarted do
+            attempt = attempt + 1
+            writeEmergencyResumeContext()
+            local teleportData = {
+                vichopRole = "searcher",
+                vichopSearcherId = SEARCHER_ID,
+                searcherId = SEARCHER_ID,
+                vichopPreviousJobId = game.JobId,
+                vichopFromJobId = game.JobId,
+                vichopExpectedJobId = game.JobId,
+                expectedJobId = game.JobId,
+                vichopEmergencyRejoin = true,
+                antiLagHopCount = runtime.hopCount,
+                successfulHopCount = runtime.successfulHopCount,
+                sameServerCount = runtime.sameServerCount,
+                httpTimeoutCount = runtime.httpTimeoutCount,
+                crashCount = runtime.crashCount,
+            }
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, PLAYER, nil, teleportData)
+            end)
+            task.wait(EMERGENCY_REJOIN_RETRY_SECONDS)
+            if attempt % 3 == 0 and not runtime.teleportStarted then
+                activateCoreRetryButton()
+            end
+        end
+        runtime.emergencyRejoinActive = false
+    end)
+end
+
+local disconnectConnection
+pcall(function()
+    disconnectConnection = GuiService.ErrorMessageChanged:Connect(function(message)
+        local currentMessage = tostring(message or "")
+        if currentMessage == "" then
+            pcall(function()
+                currentMessage = tostring(GuiService:GetErrorMessage() or "")
+            end)
+        end
+        if currentMessage ~= "" then
+            beginEmergencyRejoin(currentMessage)
+        end
+    end)
+end)
+
 local teleportConnection = TeleportService.TeleportInitFailed:Connect(function(player, result, message)
     if player == PLAYER and runtimeIsCurrent() then
         runtime.teleportError = tostring(result) .. ": " .. tostring(message)
@@ -1587,6 +1768,10 @@ local playerTeleportConnection = PLAYER.OnTeleport:Connect(function(state)
         runtime.teleportStarted = true
         runtime.active = false
         stopAntiLag()
+        if runtime.statusGui then
+            runtime.statusGui:Destroy()
+            runtime.statusGui = nil
+        end
     end
 end)
 
@@ -1606,6 +1791,17 @@ local function runSearcher()
         end
     end)
 
+    installSearcherUi()
+    setSearcherStatus("Hopping")
+    task.spawn(function()
+        while runtimeIsCurrent() do
+            local playerGui = PLAYER:FindFirstChildOfClass("PlayerGui")
+            local mainGui = playerGui and playerGui:FindFirstChild("ScreenGui")
+            hideTutorialUi(mainGui and mainGui:FindFirstChild("Tutorial"))
+            hideTutorialUi(mainGui and mainGui:FindFirstChild("TutorialButton"))
+            task.wait(0.5)
+        end
+    end)
     getVicious()
     startAntiLag()
 
@@ -1675,6 +1871,7 @@ local function runSearcher()
         if not runtime.hopping then
             local monster, level = getVicious()
             if monster then
+                setSearcherStatus("Spawned")
                 if not lastVicious then
                     runtime.holdPosition = false
                     if publishSpawn(monster, level) then
@@ -1688,6 +1885,7 @@ local function runSearcher()
                     heartbeatJob(monster, level)
                 end
             elseif lastVicious then
+                setSearcherStatus("Hopping")
                 print("[Vichop/Searcher] Vicious disappeared; leaving immediately")
                 runtime.holdPosition = false
                 task.spawn(function()
@@ -1696,6 +1894,7 @@ local function runSearcher()
                 ensureNextHop()
                 requestHop("Vicious disappeared")
             elseif os.clock() - serverStartedAtClock >= INITIAL_SCAN_SECONDS then
+                setSearcherStatus("Hopping")
                 requestHop("no live Vicious found")
             end
             if not monster then
@@ -1731,4 +1930,13 @@ if teleportConnection then
 end
 if playerTeleportConnection then
     playerTeleportConnection:Disconnect()
+end
+if disconnectConnection then
+    disconnectConnection:Disconnect()
+end
+if runtime.tutorialConnection then
+    runtime.tutorialConnection:Disconnect()
+end
+if runtime.statusGui then
+    runtime.statusGui:Destroy()
 end

@@ -2,6 +2,8 @@
 -- settles the live stinger reward, and reports one outcome per claimed event.
 
 local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+local GuiService = game:GetService("GuiService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -53,6 +55,12 @@ local COMBAT_ORBIT_SPEED = 1.65
 local COMBAT_MOVE_INTERVAL = 0.12
 local SPIKE_TRACK_SECONDS = 5
 local SPIKE_DANGER_RADIUS = 6.5
+local OVERHEAD_HEIGHT = 18
+local OVERHEAD_PLATFORM_SIZE = Vector3.new(20, 1, 20)
+local OVERHEAD_FOLLOW_SPEED = 10
+local OVERHEAD_MAX_CORRECTION_DISTANCE = 5
+local OVERHEAD_SETTLED_DISTANCE = 1.5
+local EMERGENCY_REJOIN_RETRY_SECONDS = 2
 
 if game.PlaceId ~= BSS_PLACE_ID then
     return
@@ -89,6 +97,7 @@ task.wait(CHARACTER_SETTLE_SECONDS)
 local RESUME_FILE = "vichop_killer_resume_" .. tostring(PLAYER.UserId) .. ".json"
 
 local env = type(getgenv) == "function" and getgenv() or _G
+local HIDE_KILLER_USER = env.VICHOP_HIDE_KILLER_USER ~= false
 local function readJsonFile(path)
     if type(isfile) ~= "function" or type(readfile) ~= "function" or not isfile(path) then
         return nil
@@ -134,12 +143,18 @@ end
 if type(previousRuntime) == "table" and type(previousRuntime.stopMovement) == "function" then
     pcall(previousRuntime.stopMovement, "runtime_replaced")
 end
+if type(previousRuntime) == "table" and type(previousRuntime.destroyHud) == "function" then
+    pcall(previousRuntime.destroyHud)
+end
 
 local sessionId = joinTeleportData.vichopRole == "killer" and joinTeleportData.vichopSessionId
     or env.__VICHOP_KILLER_SESSION_ID
     or getRecentStatsSessionId()
+if HIDE_KILLER_USER and type(sessionId) == "string" and string.match(sessionId, "^killer%-%d+%-") then
+    sessionId = nil
+end
 if type(sessionId) ~= "string" or sessionId == "" then
-    sessionId = "killer-" .. tostring(PLAYER.UserId) .. "-" .. HttpService:GenerateGUID(false)
+    sessionId = "killer-" .. HttpService:GenerateGUID(false)
 end
 env.__VICHOP_KILLER_SESSION_ID = sessionId
 
@@ -165,11 +180,14 @@ local runtime = {
     activeSearcherRefreshRunning = false,
     hiveClaimed = false,
     hiveName = nil,
+    emergencyRejoinActive = false,
 }
 env.__VICHOP_KILLER_RUNTIME = runtime
 
-local KILLER_NAME = PLAYER.Name
+local KILLER_NAME = HIDE_KILLER_USER and "Hidden" or PLAYER.Name
 local DISCORD_WEBHOOK_URL = type(env.VICHOP_WEBHOOK_URL) == "string" and env.VICHOP_WEBHOOK_URL or ""
+local WEBHOOK_IMAGE_URL = type(env.VICHOP_WEBHOOK_IMAGE_URL) == "string" and env.VICHOP_WEBHOOK_IMAGE_URL
+    or "https://raw.githubusercontent.com/glitchreal/jjj/main/assets/vaporwave.png"
 local WEBHOOK_USERNAME = "Vichop Tracker"
 local WEBHOOK_AVATAR_URL = ""
 local httpRequest = request or http_request or (syn and syn.request)
@@ -259,7 +277,10 @@ local function loadStats()
     stats.lastKillEventId = type(saved.lastKillEventId) == "string" and saved.lastKillEventId or ""
     stats.lastCountedJobId = type(saved.lastCountedJobId) == "string" and saved.lastCountedJobId or ""
 
-    if saved.sessionId == sessionId then
+    local migrateHiddenSession = HIDE_KILLER_USER and type(saved.sessionId) == "string"
+        and string.match(saved.sessionId, "^killer%-%d+%-") ~= nil
+        and now() - tonumber(saved.updatedAt or 0) <= SESSION_RESUME_MAX_AGE_SECONDS
+    if saved.sessionId == sessionId or migrateHiddenSession then
         for _, key in ipairs({ "sessionKills", "sessionStingers", "sessionJoins" }) do
             stats[key] = math.max(0, tonumber(saved[key]) or 0)
         end
@@ -631,10 +652,32 @@ local function tweenToHivePlatform(platform, platformPart)
         return false
     end
     local originalCollisions = {}
+    local originalAnchored = root.Anchored
+    local originalAutoRotate = humanoid.AutoRotate
     for _, descendant in ipairs(currentCharacter:GetDescendants()) do
         if descendant:IsA("BasePart") then
             originalCollisions[descendant] = descendant.CanCollide
             descendant.CanCollide = false
+        end
+    end
+    humanoid.AutoRotate = false
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    root.Anchored = true
+
+    local function restoreCharacter()
+        if root.Parent then
+            root.Anchored = originalAnchored
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+        if humanoid.Parent then
+            humanoid.AutoRotate = originalAutoRotate
+        end
+        for part, canCollide in pairs(originalCollisions) do
+            if part.Parent then
+                part.CanCollide = canCollide
+            end
         end
     end
 
@@ -648,11 +691,7 @@ local function tweenToHivePlatform(platform, platformPart)
         { CFrame = target }
     )
     if not tweenOk or not tween then
-        for part, canCollide in pairs(originalCollisions) do
-            if part.Parent then
-                part.CanCollide = canCollide
-            end
-        end
+        restoreCharacter()
         return false
     end
     local finished = false
@@ -662,11 +701,7 @@ local function tweenToHivePlatform(platform, platformPart)
     local playOk = pcall(tween.Play, tween)
     if not playOk then
         completedConnection:Disconnect()
-        for part, canCollide in pairs(originalCollisions) do
-            if part.Parent then
-                part.CanCollide = canCollide
-            end
-        end
+        restoreCharacter()
         return false
     end
     local deadline = os.clock() + duration + 0.75
@@ -677,12 +712,7 @@ local function tweenToHivePlatform(platform, platformPart)
         tween:Cancel()
     end
     completedConnection:Disconnect()
-    for part, canCollide in pairs(originalCollisions) do
-        if part.Parent then
-            part.CanCollide = canCollide
-        end
-    end
-    humanoid.AutoRotate = true
+    restoreCharacter()
     return finished and (root.Position - target.Position).Magnitude <= 7
 end
 
@@ -757,6 +787,10 @@ local movement = {
     updateConnection = nil,
     hazardConnection = nil,
     noclipConnection = nil,
+    character = nil,
+    humanoid = nil,
+    overheadPlatform = nil,
+    overheadField = nil,
     activationTarget = nil,
     activationStartedAt = 0,
     activationTouchedAt = 0,
@@ -781,6 +815,54 @@ local function getViciousActivationSpike()
     return activation and activation:IsA("BasePart") and activation or nil
 end
 
+local function positionIsInsideZone(position, zone)
+    if not zone or not zone:IsA("BasePart") then
+        return false
+    end
+    local localPosition = zone.CFrame:PointToObjectSpace(position)
+    return math.abs(localPosition.X) <= zone.Size.X * 0.5
+        and math.abs(localPosition.Z) <= zone.Size.Z * 0.5
+        and math.abs(localPosition.Y) <= 35
+end
+
+local function getOverheadCombatField(position)
+    local zones = workspace:FindFirstChild("FlowerZones")
+    if not zones then
+        return nil
+    end
+    for _, fieldName in ipairs({ "Pepper Patch", "Mountain Top Field" }) do
+        local zone = zones:FindFirstChild(fieldName)
+        if positionIsInsideZone(position, zone) then
+            return fieldName
+        end
+    end
+    return nil
+end
+
+local function createOverheadPlatform(targetPosition)
+    local ok, platform = pcall(Instance.new, "Part")
+    if not ok or not platform then
+        return nil
+    end
+    platform.Name = "VichopOverheadPlatform"
+    platform.Size = OVERHEAD_PLATFORM_SIZE
+    platform.Anchored = true
+    platform.CanCollide = true
+    platform.CanTouch = false
+    platform.CanQuery = false
+    platform.Transparency = 1
+    platform.CastShadow = false
+    platform.CFrame = CFrame.new(targetPosition + Vector3.new(0, OVERHEAD_HEIGHT, 0))
+    local parented = pcall(function()
+        platform.Parent = workspace
+    end)
+    if not parented then
+        platform:Destroy()
+        return nil
+    end
+    return platform
+end
+
 local function disableTravelNoclip()
     if movement.noclipConnection then
         movement.noclipConnection:Disconnect()
@@ -797,7 +879,8 @@ end
 local function enableTravelNoclip(currentCharacter)
     disableTravelNoclip()
     local function apply()
-        if not movement.active or (movement.mode ~= "travel" and movement.mode ~= "activate")
+        if not movement.active or (movement.mode ~= "travel" and movement.mode ~= "activate"
+            and movement.mode ~= "overhead")
             or PLAYER.Character ~= currentCharacter then
             return
         end
@@ -954,20 +1037,23 @@ local function stopMovement(reason)
             connection:Disconnect()
         end
     end
-    for _, instanceName in ipairs({ "alignPosition", "alignOrientation", "attachment" }) do
+    for _, instanceName in ipairs({ "overheadPlatform", "alignPosition", "alignOrientation", "attachment" }) do
         local instance = movement[instanceName]
         movement[instanceName] = nil
         if instance then
             instance:Destroy()
         end
     end
-    local _, humanoid = getCharacterParts()
-    if humanoid then
+    local humanoid = movement.humanoid
+    if humanoid and humanoid.Parent then
         humanoid:Move(Vector3.zero)
         if movement.originalAutoRotate ~= nil then
             humanoid.AutoRotate = movement.originalAutoRotate
         end
     end
+    movement.character = nil
+    movement.humanoid = nil
+    movement.overheadField = nil
     movement.originalAutoRotate = nil
     table.clear(movement.hazards)
     if reason then
@@ -1006,6 +1092,25 @@ local function enterCombatMode(humanoid)
     movement.lastCombatMoveAt = 0
 end
 
+local function enterOverheadMode(currentCharacter, humanoid, targetPosition)
+    local platform = createOverheadPlatform(targetPosition)
+    if not platform then
+        warn("[Vichop/Killer] Overhead platform unavailable; using ground combat fallback")
+        enterCombatMode(humanoid)
+        return false
+    end
+    movement.mode = "overhead"
+    movement.overheadPlatform = platform
+    movement.alignPosition.Enabled = true
+    movement.alignPosition.MaxVelocity = 55
+    movement.alignPosition.Responsiveness = 20
+    movement.alignOrientation.Enabled = false
+    humanoid.AutoRotate = true
+    enableTravelNoclip(currentCharacter)
+    print("[Vichop/Killer] Overhead platform active in", movement.overheadField)
+    return true
+end
+
 local function startMovement(monster)
     stopMovement()
     local currentCharacter, humanoid, root = getCharacterParts()
@@ -1016,6 +1121,9 @@ local function startMovement(monster)
 
     movement.active = true
     movement.target = monster
+    movement.character = currentCharacter
+    movement.humanoid = humanoid
+    movement.overheadField = getOverheadCombatField(monsterRoot.Position)
     movement.orbitAngle = math.atan2(root.Position.Z - monsterRoot.Position.Z, root.Position.X - monsterRoot.Position.X)
     movement.originalAutoRotate = humanoid.AutoRotate
 
@@ -1067,7 +1175,8 @@ local function startMovement(monster)
         local activeCharacter, activeHumanoid, activeRoot = getCharacterParts()
         local activeMonsterRoot = getMonsterRoot(monster)
         local monsterHumanoid = monster and monster:FindFirstChildOfClass("Humanoid")
-        if not activeCharacter or not activeMonsterRoot or not monsterHumanoid or monsterHumanoid.Health <= 0 then
+        if not activeCharacter or activeCharacter ~= movement.character or not activeMonsterRoot
+            or not monsterHumanoid or monsterHumanoid.Health <= 0 then
             stopMovement("target_unavailable")
             return
         end
@@ -1113,7 +1222,39 @@ local function startMovement(monster)
                 movement.alignOrientation.CFrame = CFrame.lookAt(activeRoot.Position, targetPosition)
             end
             if flatDistance <= TRAVEL_REACHED_DISTANCE then
+                if movement.overheadField then
+                    enterOverheadMode(activeCharacter, activeHumanoid, targetPosition)
+                else
+                    enterCombatMode(activeHumanoid)
+                end
+            end
+        elseif movement.mode == "overhead" then
+            local platform = movement.overheadPlatform
+            if not platform or not platform.Parent then
+                warn("[Vichop/Killer] Overhead platform was removed; using ground combat fallback")
                 enterCombatMode(activeHumanoid)
+                return
+            end
+            local desiredPlatform = CFrame.new(targetPosition + Vector3.new(0, OVERHEAD_HEIGHT, 0))
+            local followAlpha = 1 - math.exp(-OVERHEAD_FOLLOW_SPEED * math.max(deltaTime, 0))
+            platform.CFrame = platform.CFrame:Lerp(desiredPlatform, math.clamp(followAlpha, 0, 1))
+
+            local standingHeight = platform.Size.Y * 0.5 + activeHumanoid.HipHeight + activeRoot.Size.Y * 0.5
+            local standingPosition = platform.Position + Vector3.new(0, standingHeight, 0)
+            local horizontalError = (Vector3.new(activeRoot.Position.X, 0, activeRoot.Position.Z)
+                - Vector3.new(platform.Position.X, 0, platform.Position.Z)).Magnitude
+            local verticalError = math.abs(activeRoot.Position.Y - standingPosition.Y)
+            if horizontalError > OVERHEAD_MAX_CORRECTION_DISTANCE
+                or verticalError > OVERHEAD_MAX_CORRECTION_DISTANCE then
+                movement.alignPosition.Enabled = true
+                movement.alignPosition.Position = standingPosition
+                if not movement.noclipConnection then
+                    enableTravelNoclip(activeCharacter)
+                end
+            elseif horizontalError <= OVERHEAD_SETTLED_DISTANCE
+                and verticalError <= OVERHEAD_SETTLED_DISTANCE then
+                movement.alignPosition.Enabled = false
+                disableTravelNoclip()
             end
         else
             if flatDistance >= TRAVEL_REENTER_DISTANCE then
@@ -1134,40 +1275,55 @@ local function startMovement(monster)
 end
 
 local hud = {}
+local function positionHud()
+    if not hud.background then
+        return
+    end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+    local size = Vector2.new(430, 190)
+    local origin = Vector2.new(math.floor((viewport.X - size.X) * 0.5), math.floor((viewport.Y - size.Y) * 0.5))
+    hud.background.Size = size
+    hud.background.Position = origin
+    hud.accent.Size = Vector2.new(5, size.Y)
+    hud.accent.Position = origin
+    hud.title.Position = origin + Vector2.new(20, 13)
+    hud.body.Position = origin + Vector2.new(20, 45)
+end
+
 local function createHud()
     if not Drawing or type(Drawing.new) ~= "function" then
         return
     end
     local ok = pcall(function()
         hud.background = Drawing.new("Square")
-        hud.background.Color = Color3.fromRGB(15, 18, 23)
-        hud.background.Transparency = 0.12
+        hud.background.Color = Color3.fromRGB(0, 0, 0)
+        hud.background.Transparency = 0.08
         hud.background.Filled = true
-        hud.background.Size = Vector2.new(330, 192)
-        hud.background.Position = Vector2.new(18, 190)
         hud.background.Visible = true
 
         hud.accent = Drawing.new("Square")
-        hud.accent.Color = Color3.fromRGB(245, 181, 46)
+        hud.accent.Color = Color3.fromRGB(57, 255, 20)
         hud.accent.Transparency = 0
         hud.accent.Filled = true
-        hud.accent.Size = Vector2.new(4, 192)
-        hud.accent.Position = Vector2.new(18, 190)
         hud.accent.Visible = true
 
         hud.title = Drawing.new("Text")
-        hud.title.Color = Color3.fromRGB(255, 219, 121)
-        hud.title.Size = 18
+        hud.title.Color = Color3.fromRGB(57, 255, 20)
+        hud.title.Outline = true
+        hud.title.OutlineColor = Color3.fromRGB(0, 0, 0)
+        hud.title.Size = 20
         hud.title.Font = 2
-        hud.title.Position = Vector2.new(34, 201)
         hud.title.Visible = true
 
         hud.body = Drawing.new("Text")
-        hud.body.Color = Color3.fromRGB(228, 232, 238)
-        hud.body.Size = 15
+        hud.body.Color = Color3.fromRGB(235, 255, 235)
+        hud.body.Outline = true
+        hud.body.OutlineColor = Color3.fromRGB(0, 0, 0)
+        hud.body.Size = 17
         hud.body.Font = 2
-        hud.body.Position = Vector2.new(34, 229)
         hud.body.Visible = true
+        positionHud()
     end)
     if not ok then
         hud = {}
@@ -1175,18 +1331,28 @@ local function createHud()
     end
 end
 
+local function destroyHud()
+    for _, drawing in pairs(hud) do
+        pcall(function()
+            drawing:Remove()
+        end)
+    end
+    hud = {}
+end
+runtime.destroyHud = destroyHud
+
 local function updateHud()
     if not hud.title then
         return
     end
-    hud.title.Text = "VICHOP  |  " .. runtime.state
+    positionHud()
+    hud.title.Text = "Vichopper Made By Qitch"
     hud.body.Text = string.format(
-        "Kills       %s session  |  %s lifetime\nStingers    %s session  |  %s lifetime\nStingers/hr %s\nSearchers   %s active\nServers     %s session  |  %s lifetime\nServer      %s\nState       %s\nLast        %s\nUptime      %s",
+        "Kills       %s session  |  Total Kill %s\nStingers    %s session  |  Total Stinger %s\nStingers/hr %s\nSearchers   %s active\nState       %s\nLast        %s\nUptime      %s",
         formatNumber(stats.sessionKills), formatNumber(stats.totalKills),
         formatNumber(stats.sessionStingers), formatNumber(stats.totalStingers),
         formatRate(sessionStingersPerHour()), activeSearcherDisplay(),
-        formatNumber(stats.sessionJoins), formatNumber(stats.totalJoins),
-        shortJobId(game.JobId), runtime.detail, runtime.lastResult,
+        runtime.detail, runtime.lastResult,
         formatDuration(now() - stats.startedAt)
     )
 end
@@ -1234,21 +1400,17 @@ local function sendWebhook(report)
             timestamp = isoTimestamp(report.completedAt or now()),
             fields = {
                 { name = "Status", value = "`" .. statusText .. "`", inline = true },
-                { name = "Killer", value = "`" .. KILLER_NAME .. "`", inline = true },
-                { name = "Server ID", value = "`" .. shortJobId(report.jobId) .. "`", inline = true },
                 { name = "Stingers gained", value = webhookStingerText(report), inline = true },
                 { name = "Stinger inventory", value = webhookStingerInventoryText(report), inline = true },
                 { name = "Vicious level", value = report.level and ("`" .. tostring(report.level) .. "`") or "`Unknown`", inline = true },
-                { name = "Search / hop", value = "`" .. formatDuration(report.searchDuration) .. "`", inline = true },
                 { name = "Session kills", value = "`" .. formatNumber(stats.sessionKills) .. "`", inline = true },
                 { name = "Session stingers", value = "`" .. formatNumber(stats.sessionStingers) .. "`", inline = true },
                 { name = "Stingers / hour", value = "`" .. formatRate(sessionStingersPerHour()) .. "`", inline = true },
                 { name = "Active searchers", value = "`" .. activeSearcherDisplay() .. "`", inline = true },
-                { name = "Servers joined", value = "`" .. formatNumber(stats.sessionJoins) .. "`", inline = true },
-                { name = "Lifetime kills", value = "`" .. formatNumber(stats.totalKills) .. "`", inline = true },
-                { name = "Lifetime stingers", value = "`" .. formatNumber(stats.totalStingers) .. "`", inline = true },
-                { name = "Kill server time", value = "`" .. formatDuration(report.killServerDuration) .. "`", inline = true },
+                { name = "Total Kill", value = "`" .. formatNumber(stats.totalKills) .. "`", inline = true },
+                { name = "Total Stinger", value = "`" .. formatNumber(stats.totalStingers) .. "`", inline = true },
             },
+            image = WEBHOOK_IMAGE_URL ~= "" and { url = WEBHOOK_IMAGE_URL } or nil,
             footer = { text = "Vichop Tracker | " .. formatDuration(now() - stats.startedAt) .. " session uptime" },
         }},
     }
@@ -1570,6 +1732,10 @@ local function handleClaim(key, job)
     local confirmed, stingersBefore, failureReason = monitorConfirmedDeath(key, monster, humanoid)
     stopMovement(confirmed and "vicious_defeated" or (failureReason or "hunt_ended"))
     if not confirmed then
+        if runtime.emergencyRejoinActive then
+            warn("[Vichop/Killer] Hunt paused for emergency rejoin; preserving the current claim")
+            return false
+        end
         reportFailure(key, job, failureReason or "unconfirmed_disappearance", "Failure - unconfirmed death")
         runtime.currentClaimKey = nil
         return false
@@ -1712,6 +1878,23 @@ local function writeResumeContext(key, job)
     return writeOk
 end
 
+local function writeEmergencyResumeContext(claimKey)
+    if type(writefile) ~= "function" then
+        return false
+    end
+    local encodeOk, encoded = pcall(HttpService.JSONEncode, HttpService, {
+        vichopRole = "killer",
+        vichopSessionId = sessionId,
+        vichopExpectedJobId = game.JobId,
+        vichopClaimKey = tostring(claimKey or ""),
+        vichopFromJobId = game.JobId,
+        vichopEmergencyRejoin = true,
+        vichopRedirectCount = runtime.redirectCount,
+        savedAt = now(),
+    })
+    return encodeOk and pcall(writefile, RESUME_FILE, encoded)
+end
+
 local function waitForSearcherSlot(key, job)
     if job.searcherDeparting ~= true then
         return true, job
@@ -1798,6 +1981,80 @@ local function teleportToClaim(key, job)
     return false, runtime.teleportError or "teleport retries exhausted"
 end
 
+local function activateCoreRetryButton()
+    local ok, activated = pcall(function()
+        for _, descendant in ipairs(CoreGui:GetDescendants()) do
+            if descendant:IsA("TextButton") and descendant.Visible then
+                local text = string.lower(descendant.Text or "")
+                if text == "retry" or text == "rejoin" then
+                    if type(firesignal) == "function" then
+                        pcall(firesignal, descendant.Activated)
+                        pcall(firesignal, descendant.MouseButton1Click)
+                    else
+                        pcall(descendant.Activate, descendant)
+                    end
+                    return true
+                end
+            end
+        end
+        return false
+    end)
+    return ok and activated == true
+end
+
+local function beginEmergencyRejoin(errorMessage)
+    if runtime.emergencyRejoinActive or runtime.teleportStarted or not runtime.active then
+        return
+    end
+    runtime.emergencyRejoinActive = true
+    stopMovement("connection_lost")
+    setState("REJOINING", "Connection lost; rejoining current server")
+    warn("[Vichop/Killer] Connection error detected; rejoining exact JobId:", tostring(errorMessage))
+    task.spawn(function()
+        local attempt = 0
+        while env.__VICHOP_KILLER_RUNTIME == runtime and runtime.active and not runtime.teleportStarted do
+            attempt = attempt + 1
+            local claimKey = tostring(runtime.currentClaimKey or "")
+            if claimKey ~= "" then
+                pcall(heartbeatClaim, claimKey)
+            end
+            writeEmergencyResumeContext(claimKey)
+            local teleportData = {
+                vichopRole = "killer",
+                vichopSessionId = sessionId,
+                vichopExpectedJobId = game.JobId,
+                vichopClaimKey = claimKey,
+                vichopFromJobId = game.JobId,
+                vichopEmergencyRejoin = true,
+                vichopRedirectCount = runtime.redirectCount,
+            }
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, PLAYER, nil, teleportData)
+            end)
+            task.wait(EMERGENCY_REJOIN_RETRY_SECONDS)
+            if attempt % 3 == 0 and not runtime.teleportStarted then
+                activateCoreRetryButton()
+            end
+        end
+        runtime.emergencyRejoinActive = false
+    end)
+end
+
+local disconnectConnection
+pcall(function()
+    disconnectConnection = GuiService.ErrorMessageChanged:Connect(function(message)
+        local currentMessage = tostring(message or "")
+        if currentMessage == "" then
+            pcall(function()
+                currentMessage = tostring(GuiService:GetErrorMessage() or "")
+            end)
+        end
+        if currentMessage ~= "" then
+            beginEmergencyRejoin(currentMessage)
+        end
+    end)
+end)
+
 local teleportConnection = TeleportService.TeleportInitFailed:Connect(function(player, result, message)
     if player == PLAYER and runtime.active then
         runtime.teleportError = tostring(result) .. ": " .. tostring(message)
@@ -1809,6 +2066,7 @@ local playerTeleportConnection = PLAYER.OnTeleport:Connect(function(state)
         runtime.teleportStarted = true
         runtime.active = false
         stopMovement("teleport")
+        destroyHud()
     end
 end)
 
@@ -1864,7 +2122,7 @@ local function recoverArrivalContext()
         if teleported then
             return "redirected"
         end
-        if runtime.active then
+        if runtime.active and not runtime.emergencyRejoinActive then
             reportFailure(
                 expectedKey,
                 wrongJob,
@@ -1924,6 +2182,10 @@ local function runKiller()
 
     local lastCleanup = 0
     while runtime.active do
+        if runtime.emergencyRejoinActive then
+            task.wait(0.5)
+            continue
+        end
         local claimedSomething = false
         for _, candidate in ipairs(getSpawnedJobs()) do
             local claimed, reason, claimedJob = claimJob(candidate.key)
@@ -1937,7 +2199,7 @@ local function runKiller()
                     handleClaim(candidate.key, claimedJob)
                 else
                     local teleported, teleportError = teleportToClaim(candidate.key, claimedJob)
-                    if not teleported and runtime.active then
+                    if not teleported and runtime.active and not runtime.emergencyRejoinActive then
                         reportFailure(candidate.key, claimedJob, "teleport_failed: " .. tostring(teleportError), "Failure - teleport")
                         runtime.currentClaimKey = nil
                         runtime.currentJob = nil
@@ -1972,6 +2234,7 @@ end
 local runOk, runError = xpcall(runKiller, tracebackMessage)
 runtime.active = false
 stopMovement(runOk and "runtime_finished" or "runtime_error")
+destroyHud()
 if not runOk then
     warn("[Vichop/Killer] Main loop stopped and can be restarted:", tostring(runError))
 end
@@ -1981,4 +2244,7 @@ if teleportConnection then
 end
 if playerTeleportConnection then
     playerTeleportConnection:Disconnect()
+end
+if disconnectConnection then
+    disconnectConnection:Disconnect()
 end

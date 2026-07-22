@@ -141,6 +141,9 @@ Configure the Discord webhook before the killer loadstring in its autoexecute fi
 
 ```lua
 getgenv().VICHOP_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
+getgenv().VICHOP_HIDE_KILLER_USER = true
+-- Optional: replace the repository-owned Vaporwave banner.
+-- getgenv().VICHOP_WEBHOOK_IMAGE_URL = "https://example.com/banner.png"
 -- Use the full retrying killer loader above after setting the webhook.
 ```
 
@@ -173,7 +176,9 @@ Both active modes lower rendering quality, disable global shadows, and reduce Te
 
 The preserve rules leave `Workspace.Monsters` and everything beneath it untouched, including Vicious models, `MonsterType`, Humanoid, and level data. They also protect the local character, HumanoidRootPart, current Camera, Terrain itself, Roblox services, and instances with uncertain ancestry. The anti-lag path requires no Drawing API, hidden-property changes, hooks, debug APIs, or filesystem APIs. Filesystem support remains optional for the searcher's existing cross-teleport resume context.
 
-Aggressive mode intentionally makes most of the map invisible and removes client-side sound and effects. Use it only on dedicated searcher accounts; use `safe` while troubleshooting executor or game-update compatibility. Killer visuals, tracker, stinger counting, and webhook behavior are unchanged.
+Aggressive mode intentionally makes most of the map invisible and removes client-side sound and effects. Use it only on dedicated searcher accounts; use `safe` while troubleshooting executor or game-update compatibility. Searcher anti-lag does not run on the killer.
+
+Every searcher hides Bee Swarm's `PlayerGui.ScreenGui.Tutorial` and `TutorialButton`, including attempts by the game to show them again. A centered, bold status panel displays `Hopping` while no live Vicious Bee is present and changes to `Spawned` as soon as a living Vicious Bee is detected.
 
 ## Firebase data
 
@@ -232,6 +237,10 @@ The killer claims a hive after its character finishes loading. It inspects `Work
 
 After a claimed server is validated and a living Vicious Bee is confirmed, the killer creates one `AlignPosition` and one `AlignOrientation` on HumanoidRootPart. If `Workspace.Particles.Vicious` exists, an activation phase first drives HumanoidRootPart directly into that part and holds physical contact briefly so Bee Swarm starts the fight. It then follows the monster's HumanoidRootPart with temporary travel noclip. At combat range, the constraints and noclip are disabled and the Humanoid walks around the target at about five studs. If the Vicious Bee moves more than 14 studs away, AlignPosition travel resumes.
 
+Pepper Patch and Mountain Top Field replace the close orbit after activation with one invisible, anchored, client-created `20 x 1 x 20` platform positioned 18 studs above the Vicious Bee. Detection uses the real bounds of `Workspace.FlowerZones.Pepper Patch` and `Workspace.FlowerZones.Mountain Top Field`. The platform follows the monster at a smoothing rate of 10, while a five-stud correction threshold and 1.5-stud settle threshold keep the unanchored character centered without continually forcing movement. The character can stand and walk on the platform. If platform creation fails, the existing ground orbit remains the fallback.
+
+Only the platform is anchored. It is transparent, non-touching, non-queryable, and exists only in the local client, so it is not replicated to or controlled by other players. The platform is destroyed with the movement constraints when the Vicious Bee dies or disappears, the character changes, the claim is lost, teleport begins, the runtime is replaced, or the script ends. A live disposable simulation moved the platform for 241 frames: follow lag remained below 0.55 studs, horizontal character drift remained below the five-stud correction threshold, vertical error was effectively zero, the character remained unanchored, and the part was removed afterward. No live Vicious or Mondo Chick battle was run.
+
 Live inspection found the Vicious definition at `ReplicatedStorage.MonsterTypes.Vicious Bee`, with a 4.5-stud attack radius, three-second aiming period, and four-second attack delay. A live level-six fight confirmed that attacks create paired, top-level `Workspace.Particles.Thorn` and `Workspace.Particles.WarningDisk` parts at matching horizontal positions. The Thorn is anchored, non-collidable, initially transparent, approximately `2.44 x 22.32 x 2.44`, and uses mesh `1033714`; its warning disk is anchored, non-collidable, approximately `10 x 0.4 x 10`, and supplies the five-stud visual danger radius. Cosmetic Thorn parts under `Workspace.Particles.Vicious` belong to the Bee's visual body and are explicitly excluded.
 
 While hunting, one guarded `Workspace.DescendantAdded` listener prioritizes those exact top-level attack objects and retains combined ancestry, recent-creation, proximity, and geometry checks as a compatibility fallback. A 6.5-stud avoidance radius adds margin around the observed five-stud disk. Travel paths are deflected around tracked hazards, and combat orbit candidates are scored away from them. The exact warning-to-damage lifetime was not measured before the observed Vicious died, so hazards remain tracked for a conservative five-second window.
@@ -270,13 +279,15 @@ If either side cannot be read, the job, tracker result, and Discord embed use `U
 
 ## Tracker and statistics
 
-When `Drawing` is supported, the killer tracker shows session and lifetime kills and stingers, session stingers per hour, active searchers, joined servers, current state, shortened current server, last result, and session uptime. Console notifications remain available without `Drawing`.
+When `Drawing` is supported, the centered killer tracker uses a black panel, neon-green `Vichopper Made By Qitch` title, larger outlined text, and shows session kills and stingers, Total Kill, Total Stinger, stingers per hour, active searchers, current state, last result, and session uptime. Server ID and joined-server statistics are intentionally hidden. Console notifications remain available without `Drawing`.
 
 Lifetime and active-session values are stored in `vichop_stats.json`. The session ID is passed in teleport data and in the per-account local resume file, so session counters do not reset on every hop. Writes use a temporary file before replacing the main file. Invalid JSON is copied to a timestamped `.corrupt-*.json` backup when file APIs are available, then clean defaults are used.
 
-The Discord outcome uses inline Reward, Inventory, Session, Lifetime, Fleet, and Server fields. `Stingers / hour` is calculated from session stingers divided by persistent session uptime. `Active searchers` counts unique `searcherId` values whose `/activeServers` heartbeat is no older than 20 seconds, so one searcher with current and prepared reservations is counted once. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
+The Discord outcome keeps Reward, Inventory, Session, Total, and Fleet fields. Killer identity, server ID, search/hop time, joined-server count, and kill-server time are intentionally omitted. `Lifetime kills` and `Lifetime stingers` are presented as `Total Kill` and `Total Stinger`. The supplied Vaporwave artwork is displayed as the embed's large image; Discord does not support a custom image behind embed text. `Stingers / hour` is calculated from session stingers divided by persistent session uptime. `Active searchers` counts unique `searcherId` values whose `/activeServers` heartbeat is no older than 20 seconds, so one searcher with current and prepared reservations is counted once. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
 
-After a killer teleport, the script does not resume normal queue polling until it can verify the expected claim in Firebase. Transient Firebase HTTP failures keep the killer in a recovery state. If Roblox routes an exact-instance teleport into a different server, the killer retries the same claimed destination up to three times before marking the job failed; it does not immediately abandon the claim and hop to another job.
+After a killer teleport, the script does not resume normal queue polling until it can verify the expected claim in Firebase. Transient Firebase HTTP failures keep the killer in a recovery state. If Roblox routes an exact-instance teleport into a different server, the killer retries the same claimed destination up to five times before marking the job failed; it does not immediately abandon the claim and hop to another job.
+
+Both roles listen for Roblox `GuiService` connection and kick errors. They first preserve their local resume context and repeatedly attempt to rejoin the exact current `JobId`. If exact-instance teleport cannot start, the visible Roblox `Retry` or `Rejoin` control is activated as a fallback when the executor exposes the required GUI signal capability. Rejoining the same instance cannot be guaranteed when Roblox has closed it, the account is banned from it, or the network is completely unavailable.
 
 ## Executor compatibility
 
