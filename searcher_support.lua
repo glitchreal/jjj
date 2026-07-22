@@ -4,28 +4,10 @@
 local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local GuiService = game:GetService("GuiService")
-local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
-local SoundService = game:GetService("SoundService")
-local Stats = game:GetService("Stats")
 local TeleportService = game:GetService("TeleportService")
 
 local env = type(getgenv) == "function" and getgenv() or _G
-local ANTILAG_ENABLED = env.VICHOP_ANTILAG_ENABLED
-if type(ANTILAG_ENABLED) ~= "boolean" then
-    ANTILAG_ENABLED = true
-end
-local ANTILAG_MODE = type(env.VICHOP_ANTILAG_MODE) == "string"
-    and string.lower(env.VICHOP_ANTILAG_MODE) or "aggressive"
-if ANTILAG_MODE ~= "off" and ANTILAG_MODE ~= "safe" and ANTILAG_MODE ~= "aggressive" then
-    warn("[Vichop/AntiLag] Invalid mode; falling back to safe")
-    ANTILAG_MODE = "safe"
-end
-if not ANTILAG_ENABLED then
-    ANTILAG_MODE = "off"
-end
-env.VICHOP_ANTILAG_ENABLED = ANTILAG_ENABLED
-env.VICHOP_ANTILAG_MODE = ANTILAG_MODE
 
 local BSS_PLACE_ID = 1537690962
 local DATABASE_URL = "https://vichop-coordination-2026-default-rtdb.firebaseio.com"
@@ -55,9 +37,6 @@ local PREPARATION_STALE_SECONDS = 45
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
 local MONSTERS_READY_TIMEOUT_SECONDS = 15
-local ANTILAG_INITIAL_BATCH_SIZE = 600
-local ANTILAG_ADDED_BATCH_SIZE = 100
-local ANTILAG_HEALTH_HOP_INTERVAL = 10
 local EMERGENCY_REJOIN_RETRY_SECONDS = 2
 
 if game.PlaceId ~= BSS_PLACE_ID then
@@ -106,13 +85,6 @@ if type(previousRuntime) == "table" and previousRuntime.active and previousRunti
     print("[Vichop/Searcher] Already running in this server")
     return
 end
-if type(previousRuntime) == "table" and type(previousRuntime.antiLag) == "table"
-    and previousRuntime.antiLag.connection then
-    pcall(function()
-        previousRuntime.antiLag.connection:Disconnect()
-    end)
-end
-
 local runtime = {
     active = true,
     jobId = game.JobId,
@@ -150,16 +122,6 @@ local runtime = {
     emergencyRejoinActive = false,
     statusGui = nil,
     tutorialConnection = nil,
-    antiLag = {
-        mode = ANTILAG_MODE,
-        processed = 0,
-        disabled = 0,
-        destroyed = 0,
-        protected = 0,
-        workerRunning = false,
-        connection = nil,
-        connectionCount = 0,
-    },
 }
 env.__VICHOP_SEARCHER_RUNTIME = runtime
 
@@ -333,7 +295,7 @@ local function writeResumeContext(previousJobId, expectedJobId, prepared, reques
         decisionToCallLatency = requestedAt and (os.clock() - requestedAt) or nil,
         serverListRequests = runtime.serverListRequests,
         saw429 = runtime.saw429,
-        antiLagHopCount = runtime.hopCount,
+        hopCount = runtime.hopCount,
         successfulHopCount = runtime.successfulHopCount,
         sameServerCount = runtime.sameServerCount,
         httpTimeoutCount = runtime.httpTimeoutCount,
@@ -356,282 +318,6 @@ end
 
 local function runtimeIsCurrent()
     return runtime.active and env.__VICHOP_SEARCHER_RUNTIME == runtime
-end
-
-local processedAntiLagInstances = setmetatable({}, { __mode = "k" })
-local queuedAntiLagInstances = setmetatable({}, { __mode = "k" })
-local antiLagQueue = {}
-local antiLagQueueHead = 1
-local antiLagQueueTail = 0
-
-local disableInSafeMode = {
-    ParticleEmitter = true,
-    Trail = true,
-    Beam = true,
-    Smoke = true,
-    Fire = true,
-    Sparkles = true,
-    PointLight = true,
-    SpotLight = true,
-    SurfaceLight = true,
-    Highlight = true,
-    BloomEffect = true,
-    BlurEffect = true,
-    ColorCorrectionEffect = true,
-    DepthOfFieldEffect = true,
-    SunRaysEffect = true,
-}
-
-local function setProperty(instance, propertyName, value)
-    local readOk, current = pcall(function()
-        return instance[propertyName]
-    end)
-    if not readOk or current == value then
-        return false
-    end
-    return pcall(function()
-        instance[propertyName] = value
-    end)
-end
-
-local function isViciousRelated(instance)
-    local cursor = instance
-    while cursor and cursor ~= game do
-        if cursor:IsA("Model") then
-            local monsterType = cursor:FindFirstChild("MonsterType")
-            local typeName = monsterType and tostring(monsterType.Value) or cursor.Name
-            if string.find(string.lower(typeName), "vicious bee", 1, true) then
-                return true
-            end
-        end
-        cursor = cursor.Parent
-    end
-    return false
-end
-
-local function isProtected(instance)
-    local ok, protected = pcall(function()
-        if not instance or not instance.Parent then
-            return true
-        end
-        local monsters = workspace:FindFirstChild("Monsters")
-        local currentCharacter = PLAYER.Character
-        local currentCamera = workspace.CurrentCamera
-        if instance == workspace.Terrain or instance == monsters or instance == currentCharacter
-            or instance == currentCamera then
-            return true
-        end
-        if monsters and instance:IsDescendantOf(monsters) then
-            return true
-        end
-        if currentCharacter and instance:IsDescendantOf(currentCharacter) then
-            return true
-        end
-        if currentCamera and instance:IsDescendantOf(currentCamera) then
-            return true
-        end
-        if isViciousRelated(instance) then
-            return true
-        end
-        return not instance:IsDescendantOf(workspace)
-            and not instance:IsDescendantOf(Lighting)
-            and not instance:IsDescendantOf(SoundService)
-    end)
-    return not ok or protected
-end
-
-local function isAntiLagCandidate(instance)
-    if not instance then
-        return false
-    end
-    return disableInSafeMode[instance.ClassName] == true
-        or instance:IsA("BasePart")
-        or instance:IsA("Sound")
-        or instance:IsA("Decal")
-        or instance:IsA("Texture")
-        or instance:IsA("SelectionBox")
-end
-
-local function optimizeInstance(instance)
-    if ANTILAG_MODE == "off" or not isAntiLagCandidate(instance) or processedAntiLagInstances[instance] then
-        return
-    end
-    processedAntiLagInstances[instance] = true
-    runtime.antiLag.processed = runtime.antiLag.processed + 1
-
-    if isProtected(instance) then
-        runtime.antiLag.protected = runtime.antiLag.protected + 1
-        return
-    end
-
-    local changed = false
-    if disableInSafeMode[instance.ClassName] then
-        changed = setProperty(instance, "Enabled", false) or changed
-    elseif instance:IsA("Sound") then
-        changed = setProperty(instance, "Volume", 0) or changed
-        pcall(function()
-            instance:Stop()
-        end)
-    elseif instance:IsA("Decal") or instance:IsA("Texture") then
-        changed = setProperty(instance, "Transparency", 1) or changed
-    elseif instance:IsA("SelectionBox") then
-        changed = setProperty(instance, "Visible", false) or changed
-    end
-
-    if instance:IsA("BasePart") then
-        changed = setProperty(instance, "CastShadow", false) or changed
-        if ANTILAG_MODE == "aggressive" then
-            changed = setProperty(instance, "LocalTransparencyModifier", 1) or changed
-        end
-    end
-
-    if changed then
-        runtime.antiLag.disabled = runtime.antiLag.disabled + 1
-    end
-end
-
-local function applyGlobalRenderingOptimizations()
-    if ANTILAG_MODE == "off" then
-        return
-    end
-    pcall(function()
-        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-    end)
-    pcall(function()
-        Lighting.GlobalShadows = false
-    end)
-    local terrain = workspace:FindFirstChildOfClass("Terrain")
-    if terrain then
-        pcall(function()
-            terrain.WaterWaveSize = 0
-            terrain.WaterWaveSpeed = 0
-            terrain.WaterReflectance = 0
-        end)
-    end
-end
-
-local function antiLagMemoryMb()
-    local ok, memory = pcall(Stats.GetTotalMemoryUsageMb, Stats)
-    return ok and tonumber(memory) or 0
-end
-
-local function logAntiLagHealth(force)
-    if ANTILAG_MODE == "off" then
-        return
-    end
-    if not force and runtime.hopCount % ANTILAG_HEALTH_HOP_INTERVAL ~= 0 then
-        return
-    end
-    print(string.format(
-        "[Vichop/AntiLag] mode=%s processed=%d disabled=%d destroyed=%d protected=%d memoryMB=%.1f",
-        ANTILAG_MODE,
-        runtime.antiLag.processed,
-        runtime.antiLag.disabled,
-        runtime.antiLag.destroyed,
-        runtime.antiLag.protected,
-        antiLagMemoryMb()
-    ))
-end
-
-local startAddedAntiLagWorker
-startAddedAntiLagWorker = function()
-    if runtime.antiLag.workerRunning or antiLagQueueHead > antiLagQueueTail or not runtimeIsCurrent() then
-        return
-    end
-    runtime.antiLag.workerRunning = true
-    task.spawn(function()
-        local processedInBatch = 0
-        while runtimeIsCurrent() and antiLagQueueHead <= antiLagQueueTail do
-            local instance = antiLagQueue[antiLagQueueHead]
-            antiLagQueue[antiLagQueueHead] = nil
-            antiLagQueueHead = antiLagQueueHead + 1
-            if instance then
-                queuedAntiLagInstances[instance] = nil
-                optimizeInstance(instance)
-            end
-            processedInBatch = processedInBatch + 1
-            if processedInBatch >= ANTILAG_ADDED_BATCH_SIZE then
-                processedInBatch = 0
-                task.wait()
-            end
-        end
-        if antiLagQueueHead > antiLagQueueTail then
-            table.clear(antiLagQueue)
-            antiLagQueueHead = 1
-            antiLagQueueTail = 0
-        end
-        runtime.antiLag.workerRunning = false
-        if runtimeIsCurrent() and antiLagQueueHead <= antiLagQueueTail then
-            startAddedAntiLagWorker()
-        end
-    end)
-end
-
-local function queueAddedAntiLagInstance(instance)
-    if ANTILAG_MODE == "off" or not runtimeIsCurrent() or queuedAntiLagInstances[instance]
-        or processedAntiLagInstances[instance] or not isAntiLagCandidate(instance) then
-        return
-    end
-    local monsters = workspace:FindFirstChild("Monsters")
-    if monsters and (instance == monsters or instance:IsDescendantOf(monsters)) then
-        return
-    end
-    queuedAntiLagInstances[instance] = true
-    antiLagQueueTail = antiLagQueueTail + 1
-    antiLagQueue[antiLagQueueTail] = instance
-    startAddedAntiLagWorker()
-end
-
-local function stopAntiLag()
-    local connection = runtime.antiLag.connection
-    runtime.antiLag.connection = nil
-    runtime.antiLag.connectionCount = 0
-    if connection then
-        pcall(function()
-            connection:Disconnect()
-        end)
-    end
-    table.clear(antiLagQueue)
-    antiLagQueueHead = 1
-    antiLagQueueTail = 0
-end
-
-local function startAntiLag()
-    if ANTILAG_MODE == "off" or runtime.antiLag.connection then
-        return
-    end
-    applyGlobalRenderingOptimizations()
-    runtime.antiLag.connection = game.DescendantAdded:Connect(queueAddedAntiLagInstance)
-    runtime.antiLag.connectionCount = 1
-    env.__VICHOP_ANTILAG_TELEMETRY = runtime.antiLag
-
-    runtime.antiLag.workerRunning = true
-    task.spawn(function()
-        local roots = { workspace, Lighting, SoundService }
-        for _, root in ipairs(roots) do
-            if not runtimeIsCurrent() then
-                break
-            end
-            local descendants = root:GetDescendants()
-            for index, instance in ipairs(descendants) do
-                if not runtimeIsCurrent() then
-                    break
-                end
-                optimizeInstance(instance)
-                if index % ANTILAG_INITIAL_BATCH_SIZE == 0 then
-                    task.wait()
-                end
-            end
-            table.clear(descendants)
-            descendants = nil
-            task.wait()
-        end
-        runtime.antiLag.workerRunning = false
-        if runtimeIsCurrent() then
-            logAntiLagHealth(runtime.hopCount == 1 or runtime.hopCount % ANTILAG_HEALTH_HOP_INTERVAL == 0)
-            startAddedAntiLagWorker()
-        end
-    end)
 end
 
 local function beginBackgroundRequest()
@@ -1629,7 +1315,7 @@ end
 
 local teleportDataOnJoin = getJoinTeleportData()
 if teleportDataOnJoin.vichopRole == "searcher" then
-    runtime.hopCount = math.max(1, (tonumber(teleportDataOnJoin.antiLagHopCount) or 0) + 1)
+    runtime.hopCount = math.max(1, (tonumber(teleportDataOnJoin.hopCount) or 0) + 1)
     runtime.successfulHopCount = math.max(0, tonumber(teleportDataOnJoin.successfulHopCount) or 0)
     runtime.sameServerCount = math.max(0, tonumber(teleportDataOnJoin.sameServerCount) or 0)
     runtime.httpTimeoutCount = math.max(0, tonumber(teleportDataOnJoin.httpTimeoutCount) or 0)
@@ -1705,7 +1391,7 @@ local function writeEmergencyResumeContext()
         vichopExpectedJobId = game.JobId,
         expectedJobId = game.JobId,
         vichopEmergencyRejoin = true,
-        antiLagHopCount = runtime.hopCount,
+        hopCount = runtime.hopCount,
         successfulHopCount = runtime.successfulHopCount,
         sameServerCount = runtime.sameServerCount,
         httpTimeoutCount = runtime.httpTimeoutCount,
@@ -1738,7 +1424,7 @@ local function beginEmergencyRejoin(errorMessage)
                 vichopExpectedJobId = game.JobId,
                 expectedJobId = game.JobId,
                 vichopEmergencyRejoin = true,
-                antiLagHopCount = runtime.hopCount,
+                hopCount = runtime.hopCount,
                 successfulHopCount = runtime.successfulHopCount,
                 sameServerCount = runtime.sameServerCount,
                 httpTimeoutCount = runtime.httpTimeoutCount,
@@ -1781,7 +1467,6 @@ local playerTeleportConnection = PLAYER.OnTeleport:Connect(function(state)
     if state == Enum.TeleportState.Started and env.__VICHOP_SEARCHER_RUNTIME == runtime then
         runtime.teleportStarted = true
         runtime.active = false
-        stopAntiLag()
         if runtime.statusGui then
             runtime.statusGui:Destroy()
             runtime.statusGui = nil
@@ -1817,8 +1502,6 @@ local function runSearcher()
         end
     end)
     getVicious()
-    startAntiLag()
-
     local arrivedValid, arrivalReason = validateArrivedServer(teleportDataOnJoin)
     runtime.arrivalStatus = arrivalReason
     if not arrivedValid then
@@ -1938,7 +1621,6 @@ if not runOk then
     warn("[Vichop/Searcher] Main loop stopped and can be restarted:", tostring(runError))
 end
 
-stopAntiLag()
 if teleportConnection then
     teleportConnection:Disconnect()
 end
