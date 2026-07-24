@@ -10,7 +10,7 @@ local TeleportService = game:GetService("TeleportService")
 local env = type(getgenv) == "function" and getgenv() or _G
 
 local BSS_PLACE_ID = 1537690962
-local DATABASE_URL = "https://vichop-coordination-2026-default-rtdb.firebaseio.com"
+local DATABASE_URL = "https://bss-job-queue-default-rtdb.firebaseio.com"
 local ROBLOX_SERVER_LIST_URL = "https://games.roblox.com/v1/games/" .. tostring(BSS_PLACE_ID)
     .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
 local INITIAL_SCAN_SECONDS = 5

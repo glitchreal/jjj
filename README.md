@@ -162,7 +162,7 @@ Every searcher hides Bee Swarm's `PlayerGui.ScreenGui.Tutorial` and `TutorialBut
 The database URL remains:
 
 ```text
-https://vichop-coordination-2026-default-rtdb.firebaseio.com
+https://bss-job-queue-default-rtdb.firebaseio.com
 ```
 
 Data is stored under these paths:

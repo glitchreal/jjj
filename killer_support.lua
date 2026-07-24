@@ -13,7 +13,7 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 
 local BSS_PLACE_ID = 1537690962
-local DATABASE_URL = "https://vichop-coordination-2026-default-rtdb.firebaseio.com"
+local DATABASE_URL = "https://bss-job-queue-default-rtdb.firebaseio.com"
 local STATS_FILE = "vichop_stats.json"
 local QUEUE_POLL_SECONDS = 2
 local ARRIVAL_WAIT_SECONDS = 15
