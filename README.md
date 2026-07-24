@@ -299,6 +299,8 @@ The Discord outcome keeps Reward, Inventory, Session, Total, and Fleet fields wi
 
 After a killer teleport, the script does not resume normal queue polling until it can verify the expected claim in Firebase. Transient Firebase HTTP failures keep the killer in a recovery state. If Roblox routes an exact-instance teleport into a different server, the killer retries the same claimed destination up to five times before marking the job failed; it does not immediately abandon the claim and hop to another job.
 
+If the killer character dies during combat, the Firebase claim continues to heartbeat while the script waits for Roblox to respawn the character. As soon as the new Humanoid and HumanoidRootPart are ready, the movement controller recreates its attachments, platform, and hazard tracking against the same live Vicious Bee. This repeats after subsequent deaths until the Vicious Bee is confirmed dead, the claim is lost, the target disappears, or the ten-minute hunt deadline is reached.
+
 Both roles listen for Roblox `GuiService` connection and kick errors. They first preserve their local resume context and repeatedly attempt to rejoin the exact current `JobId`. If exact-instance teleport cannot start, the visible Roblox `Retry` or `Rejoin` control is activated as a fallback when the executor exposes the required GUI signal capability. Rejoining the same instance cannot be guaranteed when Roblox has closed it, the account is banned from it, or the network is completely unavailable.
 
 ## Executor compatibility

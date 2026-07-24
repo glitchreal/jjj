@@ -2202,6 +2202,8 @@ local function monitorConfirmedDeath(key, monster, humanoid)
     local deadline = os.clock() + MAX_HUNT_SECONDS
     local confirmed = false
     local failureReason = nil
+    local movementRetryAt = 0
+    local waitingForRespawn = false
 
     while runtime.active and os.clock() <= deadline do
         if game.JobId ~= key then
@@ -2217,6 +2219,28 @@ local function monitorConfirmedDeath(key, monster, humanoid)
             break
         end
 
+        if not movement.active and os.clock() >= movementRetryAt then
+            local currentCharacter = getCharacterParts()
+            if currentCharacter then
+                if startMovement(monster) then
+                    if waitingForRespawn then
+                        print("[Vichop/Killer] Character respawned; resumed Vicious movement")
+                    end
+                    waitingForRespawn = false
+                    setState("HUNTING", "Vicious Bee active")
+                else
+                    movementRetryAt = os.clock() + 0.5
+                end
+            else
+                if not waitingForRespawn then
+                    print("[Vichop/Killer] Character died; preserving claim until respawn")
+                end
+                waitingForRespawn = true
+                movementRetryAt = os.clock() + 0.5
+                setState("RESPAWNING", "Claim preserved; waiting to resume Vicious hunt")
+            end
+        end
+
         local latest = getStingers()
         if latest ~= nil and latest ~= stingersBefore then
             stingersBefore = latest
@@ -2230,7 +2254,11 @@ local function monitorConfirmedDeath(key, monster, humanoid)
                 break
             end
         end
-        setState("HUNTING", "Vicious Bee active")
+        if waitingForRespawn then
+            setState("RESPAWNING", "Claim preserved; waiting to resume Vicious hunt")
+        else
+            setState("HUNTING", "Vicious Bee active")
+        end
         task.wait(HUNT_POLL_SECONDS)
     end
 
