@@ -174,11 +174,12 @@ Data is stored under these paths:
 /fleetRecent/<JobId>                  most recent fleet visit
 /candidatePool/<JobId>                cached public destination metadata
 /candidatePoolMeta/refillLease        fleet-wide discovery lease
+/candidatePoolMeta/cleanupLease       fleet-wide stale-data cleanup lease
 /candidatePoolMeta/cooldownUntil      shared Roblox rate-limit cooldown
 /candidatePoolMeta/nextCursor         next server-list page cursor
 ```
 
-An active reservation contains `searcherId`, `claimedAt`, `heartbeatAt`, and `placeId`. Searchers refresh current and prepared reservations every 3 seconds; a heartbeat older than 20 seconds is abandoned and can be replaced. Per-searcher history is retained for 10 minutes, and fleet history excludes a server for 45 seconds.
+An active reservation contains only `searcherId`, `claimedAt`, `heartbeatAt`, and `placeId`. Fleet-history records contain only `checkedAt`, and per-searcher history is a timestamp scalar. Searchers refresh current and prepared reservations every 8 seconds; a heartbeat older than 30 seconds is abandoned and can be replaced. Per-searcher history is retained for 10 minutes, fleet history excludes a server for 45 seconds, and old fleet-history records are deleted after five minutes.
 
 Reservations and killer claims use Firebase REST ETags with `if-match`. This compare-and-swap operation prevents two clients from winning the same reservation or queue claim after reading the same old value. If an executor does not expose Firebase's `ETag` response header, the script refuses the unsafe claim instead of falling back to read-then-write.
 
@@ -198,7 +199,41 @@ TeleportService:TeleportToPlaceInstance(
 
 `preparedJobId` is atomically reserved and must differ from the current and previous JobIds. Generic same-place matchmaking is disabled because it can return the same server. The Roblox public-server endpoint is used only by the background fleet refiller, never by the teleport controller.
 
-Only one searcher may hold the refill lease. Its cursor and `Retry-After` cooldown are shared in Firebase, so other searchers consume cached candidates without hitting Roblox. Candidates expire after three minutes, full servers are rejected, consumed candidates are removed, and the pool is capped at 120 entries.
+Only one searcher may hold the refill lease. A client acquires that lease before it reads any pool-wide metadata, performs one shallow key-count request, deletes at most 20 timestamp-indexed stale candidates, and fetches Roblox server pages only when the pool is below its target. Its cursor and `Retry-After` cooldown are shared in Firebase, so other searchers consume cached candidates without hitting Roblox.
+
+Each candidate is a compact record containing only `playing` and `discoveredAt`; the Firebase key is the exact `JobId`, and the place is fixed by this deployment. Candidates expire after three minutes, full servers are rejected at discovery, consumed candidates are removed, and the pool is capped at 120 entries. A searcher chooses a deterministic pseudo-random start key for its current runtime and requests an 18-item key window, wrapping to the start only when that window has fewer than four records. This spreads the ten searchers across the bounded queue instead of making all of them download or race the same prefix. The searcher keeps the result in a 15-second local cache and refreshes only when fewer than four remain. It checks timestamps locally, then reads `/recentServers/<searcherId>/<JobId>` and `/fleetRecent/<JobId>` individually before attempting the existing per-record ETag reservation. It never downloads `/candidatePool`, `/recentServers`, or `/fleetRecent` as a complete object.
+
+Fleet-wide cleanup also uses a separate short lease, so only one searcher runs global retention work. It uses indexed, 20-record timestamp batches for expired reservations, stale jobs, and fleet history. Every searcher deletes its own expired recent-history entries with a bounded value query. Terminal jobs are retained for one hour, active reservations for only their 30-second lease, candidate records for three minutes, and fleet history records for five minutes. These limits keep the database bounded during continuous operation even if a client exits without releasing its records.
+
+The killer polls at two-second intervals and requests at most 12 `spawned` jobs. Its active-searcher count reads only fresh heartbeat rows, and job cleanup reads at most 25 old rows ordered by `updatedAt`. All claim, reservation, arrival, and duplicate-server decisions that concern one server read only that server's exact path. ETag compare-and-swap remains scoped to `/jobs/<JobId>`, `/activeServers/<JobId>`, or an individual lease record.
+
+Both scripts expose cumulative bandwidth counters on their runtime tables and print them once per minute:
+
+```text
+Firebase bandwidth | reads=<count> writes=<count> downloaded=<bytes>B fullTreeReads=<count>
+```
+
+`downloaded` is the response-body byte count seen by the executor and is a close estimate of billable Firebase download volume. `fullTreeReads` should stay at zero; it counts unfiltered GETs of the five historically expensive top-level branches.
+
+The complete GET inventory and maximum downloaded subtree per call is:
+
+| Caller | Firebase GET | Maximum returned subtree |
+| --- | --- | --- |
+| Both roles | ETag GET on `/activeServers/<JobId>` or `/jobs/<JobId>` | One reservation or job record |
+| Searcher | ETag GET on `refillLease` or `cleanupLease` | One small lease record |
+| Lease holder | `candidatePool` ordered by `discoveredAt`, stale batch | 20 candidate records |
+| Lease holder | `candidatePool?shallow=true` | At most 120 keys and boolean values; no candidate payloads |
+| Lease holder | `cooldownUntil`, `nextCursor` | One scalar each |
+| Searcher | `candidatePool` ordered by key from a pseudo-random start | 18 compact candidate records; one bounded wrap query only for a short tail |
+| Searcher | `recentServers/<searcherId>/<JobId>`, `fleetRecent/<JobId>` | One scalar and one visit record |
+| Searcher | own recent cleanup ordered by value | 20 timestamps |
+| Cleanup lease holder | stale `activeServers`, `jobs`, or `fleetRecent` query | 20 records from the selected branch |
+| Killer | fresh `activeServers` query | 40 reservation records |
+| Killer | `jobs` filtered to `spawned` | 12 job records |
+| Killer | old `jobs` cleanup query | 25 job records |
+| Killer | `/jobs/<JobId>` arrival/claim validation | One exact job record |
+
+At the previous observed workload, repeated full branch reads produced 17.6 GB/month. With 18-row candidate windows, exact per-JobId history checks, 20–25-row maintenance batches, half-frequency reservation heartbeats, and lease-only pool maintenance, the expected steady-state range is roughly 1.5–3 GB/month for the same ten searchers (about 83–91% less). Actual usage depends on hop rate and record sizes; the runtime byte counter is the source of truth for validating the estimate after deployment.
 
 The resume file carries the previous and expected JobIds, candidate source, preparation state, and decision-to-call latency. Arrival is valid only when the actual JobId differs from the previous one and matches the expected one. Ownership is then revalidated before the server is marked visited.
 
@@ -260,7 +295,7 @@ The killer tracker is a centered native Roblox panel using the repository-owned 
 
 Lifetime and active-session values are stored in `vichop_stats.json`. The session ID is passed in teleport data and in the per-account local resume file, so session counters do not reset on every hop. Writes use a temporary file before replacing the main file. Invalid JSON is copied to a timestamped `.corrupt-*.json` backup when file APIs are available, then clean defaults are used.
 
-The Discord outcome keeps Reward, Inventory, Session, Total, and Fleet fields without a decorative embed image. Killer identity, server ID, search/hop time, joined-server count, and kill-server time are intentionally omitted. `Lifetime kills` and `Lifetime stingers` are presented as `Total Kill` and `Total Stinger`. `Stingers / hour` is calculated from session stingers divided by persistent session uptime. `Active searchers` counts unique `searcherId` values whose `/activeServers` heartbeat is no older than 20 seconds, so one searcher with current and prepared reservations is counted once. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
+The Discord outcome keeps Reward, Inventory, Session, Total, and Fleet fields without a decorative embed image. Killer identity, server ID, search/hop time, joined-server count, and kill-server time are intentionally omitted. `Lifetime kills` and `Lifetime stingers` are presented as `Total Kill` and `Total Stinger`. `Stingers / hour` is calculated from session stingers divided by persistent session uptime. `Active searchers` counts unique `searcherId` values whose `/activeServers` heartbeat is no older than 30 seconds, so one searcher with current and prepared reservations is counted once. Webhook work starts asynchronously after the final stinger result is known. Before another teleport, the script allows an in-flight report only a short grace period so a slow webhook cannot stall hopping indefinitely.
 
 After a killer teleport, the script does not resume normal queue polling until it can verify the expected claim in Firebase. Transient Firebase HTTP failures keep the killer in a recovery state. If Roblox routes an exact-instance teleport into a different server, the killer retries the same claimed destination up to five times before marking the job failed; it does not immediately abandon the claim and hop to another job.
 

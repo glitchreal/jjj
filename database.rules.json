@@ -11,6 +11,7 @@
     },
     "activeServers": {
       ".read": true,
+      ".indexOn": ["heartbeatAt"],
       "$job": {
         ".write": "!newData.exists() || (newData.hasChildren(['searcherId', 'claimedAt', 'heartbeatAt', 'placeId']) && newData.child('searcherId').isString() && newData.child('claimedAt').isNumber() && newData.child('heartbeatAt').isNumber() && newData.child('placeId').isNumber())"
       }
@@ -18,6 +19,7 @@
     "recentServers": {
       ".read": true,
       "$searcher": {
+        ".indexOn": ".value",
         "$job": {
           ".write": "!newData.exists() || newData.isNumber()"
         }
@@ -25,20 +27,25 @@
     },
     "fleetRecent": {
       ".read": true,
+      ".indexOn": ["checkedAt"],
       "$job": {
-        ".write": "!newData.exists() || (newData.hasChildren(['searcherId', 'checkedAt', 'placeId']) && newData.child('searcherId').isString() && newData.child('checkedAt').isNumber() && newData.child('placeId').isNumber())"
+        ".write": "!newData.exists() || (newData.hasChildren(['checkedAt']) && newData.child('checkedAt').isNumber())"
       }
     },
     "candidatePool": {
       ".read": true,
+      ".indexOn": ["discoveredAt"],
       "$job": {
-        ".write": "!newData.exists() || (newData.hasChildren(['jobId', 'placeId', 'playing', 'maxPlayers', 'discoveredAt', 'discoveredBy']) && newData.child('jobId').isString() && newData.child('placeId').isNumber() && newData.child('playing').isNumber() && newData.child('maxPlayers').isNumber() && newData.child('discoveredAt').isNumber() && newData.child('discoveredBy').isString())"
+        ".write": "!newData.exists() || (newData.hasChildren(['playing', 'discoveredAt']) && newData.child('playing').isNumber() && newData.child('discoveredAt').isNumber())"
       }
     },
     "candidatePoolMeta": {
       ".read": true,
       "refillLease": {
         ".write": "!newData.exists() || (newData.hasChildren(['searcherId', 'leaseId', 'acquiredAt', 'heartbeatAt', 'expiresAt']) && newData.child('searcherId').isString() && newData.child('leaseId').isString() && newData.child('acquiredAt').isNumber() && newData.child('heartbeatAt').isNumber() && newData.child('expiresAt').isNumber())"
+      },
+      "cleanupLease": {
+        ".write": "!newData.exists() || (newData.hasChildren(['searcherId', 'leaseId', 'expiresAt']) && newData.child('searcherId').isString() && newData.child('leaseId').isString() && newData.child('expiresAt').isNumber())"
       },
       "cooldownUntil": {
         ".write": "!newData.exists() || newData.isNumber()"

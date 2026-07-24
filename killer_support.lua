@@ -15,7 +15,7 @@ local UserInputService = game:GetService("UserInputService")
 local BSS_PLACE_ID = 1537690962
 local DATABASE_URL = "https://vichop-coordination-2026-default-rtdb.firebaseio.com"
 local STATS_FILE = "vichop_stats.json"
-local QUEUE_POLL_SECONDS = 0.75
+local QUEUE_POLL_SECONDS = 2
 local ARRIVAL_WAIT_SECONDS = 15
 local HUNT_POLL_SECONDS = 0.1
 local MAX_HUNT_SECONDS = 10 * 60
@@ -24,8 +24,8 @@ local REWARD_MAX_SECONDS = 8
 local REWARD_STABLE_READS = 3
 local JOB_FRESH_SECONDS = 25
 local CLAIM_LEASE_SECONDS = 30
-local CLAIM_HEARTBEAT_SECONDS = 5
-local CLEANUP_INTERVAL_SECONDS = 30
+local CLAIM_HEARTBEAT_SECONDS = 10
+local CLEANUP_INTERVAL_SECONDS = 60
 local TERMINAL_RETENTION_SECONDS = 60 * 60
 local HTTP_TIMEOUT_SECONDS = 15
 local TELEPORT_TIMEOUT_SECONDS = 7
@@ -35,9 +35,10 @@ local SLOT_HANDOFF_POLL_SECONDS = 0.5
 local ARRIVAL_COORDINATION_RETRY_SECONDS = 30
 local MAX_WRONG_SERVER_REDIRECTS = 3
 local SESSION_RESUME_MAX_AGE_SECONDS = 20 * 60
-local ACTIVE_SEARCHER_TTL_SECONDS = 20
-local ACTIVE_SEARCHER_REFRESH_SECONDS = 10
-local ACTIVE_SEARCHER_STALE_SECONDS = 45
+local ACTIVE_SEARCHER_TTL_SECONDS = 30
+local ACTIVE_SEARCHER_REFRESH_SECONDS = 20
+local ACTIVE_SEARCHER_STALE_SECONDS = 60
+local FIREBASE_STATS_LOG_SECONDS = 60
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
 local HIVE_CLAIM_TIMEOUT_SECONDS = 8
@@ -192,6 +193,11 @@ local runtime = {
     activeSearcherCount = nil,
     activeSearcherCountAt = 0,
     activeSearcherRefreshRunning = false,
+    firebaseReads = 0,
+    firebaseWrites = 0,
+    firebaseDownloadedBytes = 0,
+    firebaseFullTreeReads = 0,
+    firebaseStatsLoggedAt = 0,
     hiveClaimed = false,
     hiveName = nil,
     emergencyRejoinActive = false,
@@ -440,6 +446,29 @@ local function firebaseRequest(method, path, body, extraHeaders)
         options.Body = encoded
     end
     local response, status = rawRequest(options)
+    if method == "GET" then
+        runtime.firebaseReads = runtime.firebaseReads + 1
+        local responseBody = response and (response.Body or response.body) or ""
+        runtime.firebaseDownloadedBytes = runtime.firebaseDownloadedBytes
+            + (type(responseBody) == "string" and #responseBody or 0)
+        local rootPath = string.match(path, "^/([^/?]+)%.json$")
+        if rootPath == "candidatePool" or rootPath == "recentServers" or rootPath == "fleetRecent"
+            or rootPath == "activeServers" or rootPath == "jobs" then
+            runtime.firebaseFullTreeReads = runtime.firebaseFullTreeReads + 1
+        end
+    elseif method == "PUT" or method == "PATCH" or method == "POST" or method == "DELETE" then
+        runtime.firebaseWrites = runtime.firebaseWrites + 1
+    end
+    if os.clock() - runtime.firebaseStatsLoggedAt >= FIREBASE_STATS_LOG_SECONDS then
+        runtime.firebaseStatsLoggedAt = os.clock()
+        print(string.format(
+            "[Vichop/Killer] Firebase bandwidth | reads=%d writes=%d downloaded=%dB fullTreeReads=%d",
+            runtime.firebaseReads,
+            runtime.firebaseWrites,
+            runtime.firebaseDownloadedBytes,
+            runtime.firebaseFullTreeReads
+        ))
+    end
     if status < 200 or status >= 300 then
         if status ~= 412 then
             warn("[Vichop/Killer] Firebase request failed:", method, path, status)
@@ -522,7 +551,11 @@ local function jobPath(key)
 end
 
 local function getActiveSearcherCount()
-    local reservations, readOk = firebaseGet("/activeServers.json")
+    local query = string.format(
+        '/activeServers.json?orderBy="heartbeatAt"&startAt=%d&limitToFirst=40',
+        now() - ACTIVE_SEARCHER_TTL_SECONDS
+    )
+    local reservations, readOk = firebaseGet(query)
     if not readOk or type(reservations) ~= "table" then
         return nil
     end
@@ -2322,7 +2355,7 @@ local function handleClaim(key, job)
 end
 
 local function getSpawnedJobs()
-    local data = firebaseGet('/jobs.json?orderBy="status"&equalTo="spawned"&limitToFirst=50') or {}
+    local data = firebaseGet('/jobs.json?orderBy="status"&equalTo="spawned"&limitToFirst=12') or {}
     local timestamp = now()
     local jobs = {}
     for key, job in pairs(data) do
@@ -2354,8 +2387,12 @@ local function getSpawnedJobs()
 end
 
 local function cleanupOldData()
-    local data = firebaseGet("/jobs.json") or {}
     local timestamp = now()
+    local query = string.format(
+        '/jobs.json?orderBy="updatedAt"&endAt=%d&limitToFirst=25',
+        timestamp - CLAIM_LEASE_SECONDS
+    )
+    local data = firebaseGet(query) or {}
     local deleted = 0
     for key, job in pairs(data) do
         if type(job) == "table" then

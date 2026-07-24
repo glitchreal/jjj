@@ -15,13 +15,16 @@ local ROBLOX_SERVER_LIST_URL = "https://games.roblox.com/v1/games/" .. tostring(
     .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
 local INITIAL_SCAN_SECONDS = 5
 local SCAN_INTERVAL_SECONDS = 0.25
-local HEARTBEAT_SECONDS = 5
-local RESERVATION_HEARTBEAT_SECONDS = 3
-local RESERVATION_TTL_SECONDS = 20
+local HEARTBEAT_SECONDS = 10
+local RESERVATION_HEARTBEAT_SECONDS = 8
+local RESERVATION_TTL_SECONDS = 30
 local OWN_RECENT_TTL_SECONDS = 10 * 60
 local FLEET_RECENT_TTL_SECONDS = 45
-local JOB_STALE_SECONDS = 35
-local CLEANUP_INTERVAL_SECONDS = 30
+local FLEET_RECENT_RETENTION_SECONDS = 5 * 60
+local JOB_STALE_SECONDS = 45
+local RESOLUTION_STALE_SECONDS = 60
+local TERMINAL_JOB_RETENTION_SECONDS = 60 * 60
+local CLEANUP_INTERVAL_SECONDS = 60
 local HTTP_TIMEOUT_SECONDS = 15
 local TELEPORT_TIMEOUT_SECONDS = 7
 local TELEPORT_BACKOFF_MAX_SECONDS = 3
@@ -29,10 +32,16 @@ local KILLER_SLOT_RELEASE_GRACE_SECONDS = 3
 local CANDIDATE_TTL_SECONDS = 3 * 60
 local CANDIDATE_POOL_TARGET = 35
 local CANDIDATE_POOL_MAX = 120
-local CANDIDATE_RESERVATION_ATTEMPTS = 12
-local REFILL_LEASE_SECONDS = 15
+local CANDIDATE_QUERY_LIMIT = 18
+local CANDIDATE_CACHE_SECONDS = 15
+local CANDIDATE_CACHE_LOW_WATER = 4
+local CANDIDATE_RESERVATION_ATTEMPTS = 8
+local REFILL_LEASE_SECONDS = 45
 local REFILL_PAGES_PER_LEASE = 2
 local REFILL_RETRY_SECONDS = 2
+local CLEANUP_LEASE_SECONDS = 45
+local CLEANUP_BATCH_SIZE = 20
+local FIREBASE_STATS_LOG_SECONDS = 60
 local PREPARATION_STALE_SECONDS = 45
 local CHARACTER_READY_TIMEOUT_SECONDS = 30
 local CHARACTER_SETTLE_SECONDS = 2
@@ -113,6 +122,13 @@ local runtime = {
     state = "STARTING",
     serverListRequests = 0,
     saw429 = false,
+    candidateCache = {},
+    candidateCacheAt = 0,
+    firebaseReads = 0,
+    firebaseWrites = 0,
+    firebaseDownloadedBytes = 0,
+    firebaseFullTreeReads = 0,
+    firebaseStatsLoggedAt = 0,
     hopRecords = {},
     hopCount = 1,
     successfulHopCount = 0,
@@ -426,6 +442,29 @@ local function firebaseRequest(method, path, body, extraHeaders)
         options.Body = encoded
     end
     local response, status = rawRequest(options)
+    if method == "GET" then
+        runtime.firebaseReads = runtime.firebaseReads + 1
+        local responseBody = response and (response.Body or response.body) or ""
+        runtime.firebaseDownloadedBytes = runtime.firebaseDownloadedBytes
+            + (type(responseBody) == "string" and #responseBody or 0)
+        local rootPath = string.match(path, "^/([^/?]+)%.json$")
+        if rootPath == "candidatePool" or rootPath == "recentServers" or rootPath == "fleetRecent"
+            or rootPath == "activeServers" or rootPath == "jobs" then
+            runtime.firebaseFullTreeReads = runtime.firebaseFullTreeReads + 1
+        end
+    elseif method == "PUT" or method == "PATCH" or method == "POST" or method == "DELETE" then
+        runtime.firebaseWrites = runtime.firebaseWrites + 1
+    end
+    if os.clock() - runtime.firebaseStatsLoggedAt >= FIREBASE_STATS_LOG_SECONDS then
+        runtime.firebaseStatsLoggedAt = os.clock()
+        print(string.format(
+            "[Vichop/Searcher] Firebase bandwidth | reads=%d writes=%d downloaded=%dB fullTreeReads=%d",
+            runtime.firebaseReads,
+            runtime.firebaseWrites,
+            runtime.firebaseDownloadedBytes,
+            runtime.firebaseFullTreeReads
+        ))
+    end
     if status < 200 or status >= 300 then
         if status ~= 412 then
             warn("[Vichop/Searcher] Firebase request failed:", method, path, status)
@@ -529,7 +568,6 @@ local function reserveServer(jobId)
         end
         return {
             searcherId = SEARCHER_ID,
-            searcherName = PLAYER.Name,
             claimedAt = claimedAt,
             heartbeatAt = timestamp,
             placeId = game.PlaceId,
@@ -561,9 +599,7 @@ local function markVisited(jobId)
     local timestamp = now()
     firebaseWrite("PUT", "/recentServers/" .. SEARCHER_ID .. "/" .. tostring(jobId) .. ".json", timestamp)
     firebaseWrite("PUT", "/fleetRecent/" .. tostring(jobId) .. ".json", {
-        searcherId = SEARCHER_ID,
         checkedAt = timestamp,
-        placeId = game.PlaceId,
     })
 end
 
@@ -582,11 +618,7 @@ end
 
 local function candidateIsFresh(candidate, timestamp)
     return type(candidate) == "table"
-        and type(candidate.jobId) == "string"
-        and candidate.jobId ~= ""
-        and tonumber(candidate.placeId) == game.PlaceId
         and tonumber(candidate.discoveredAt or 0) >= timestamp - CANDIDATE_TTL_SECONDS
-        and tonumber(candidate.playing or 0) < tonumber(candidate.maxPlayers or 0)
 end
 
 local function acquireRefillLease()
@@ -615,44 +647,54 @@ local function releaseRefillLease(leaseId)
     end)
 end
 
-local function pruneCandidatePool(pool)
+local function acquireCleanupLease()
     local timestamp = now()
-    local entries = {}
-    for jobId, candidate in pairs(type(pool) == "table" and pool or {}) do
-        table.insert(entries, {
-            jobId = jobId,
-            stale = not candidateIsFresh(candidate, timestamp),
-            discoveredAt = tonumber(type(candidate) == "table" and candidate.discoveredAt or 0) or 0,
-        })
-    end
-    table.sort(entries, function(a, b)
-        if a.stale ~= b.stale then
-            return a.stale
+    local leaseId = runtime.generation .. ":cleanup:" .. tostring(timestamp)
+    local acquired = atomicMutate("/candidatePoolMeta/cleanupLease.json", function(current)
+        if type(current) == "table" and tonumber(current.expiresAt or 0) > timestamp
+            and current.searcherId ~= SEARCHER_ID then
+            return nil, "lease_held"
         end
-        return a.discoveredAt < b.discoveredAt
+        return {
+            searcherId = SEARCHER_ID,
+            leaseId = leaseId,
+            expiresAt = timestamp + CLEANUP_LEASE_SECONDS,
+        }, "lease_acquired"
+    end, 2)
+    return acquired and leaseId or nil
+end
+
+local function releaseCleanupLease(leaseId)
+    return atomicDeleteIf("/candidatePoolMeta/cleanupLease.json", function(current)
+        return type(current) == "table" and current.searcherId == SEARCHER_ID
+            and current.leaseId == leaseId
     end)
+end
 
-    local staleCount = 0
-    for index = 1, #entries do
-        if entries[index].stale then
-            staleCount = staleCount + 1
-        end
-    end
-    local removeCount = math.min(30, #entries, math.max(staleCount, #entries - CANDIDATE_POOL_MAX))
-    for index = 1, removeCount do
-        firebaseWrite("DELETE", candidatePath(entries[index].jobId))
-        pool[entries[index].jobId] = nil
+local function pruneCandidatePool()
+    local cutoff = now() - CANDIDATE_TTL_SECONDS
+    local stalePath = string.format(
+        '/candidatePool.json?orderBy="discoveredAt"&endAt=%d&limitToFirst=%d',
+        cutoff,
+        CLEANUP_BATCH_SIZE
+    )
+    local stale = firebaseGet(stalePath) or {}
+    for jobId in pairs(type(stale) == "table" and stale or {}) do
+        atomicDeleteIf(candidatePath(jobId), function(current)
+            return type(current) ~= "table"
+                or tonumber(current.discoveredAt or 0) <= now() - CANDIDATE_TTL_SECONDS
+        end)
     end
 
-    local remaining = 0
-    local fresh = 0
-    for _, candidate in pairs(pool) do
-        remaining = remaining + 1
-        if candidateIsFresh(candidate, timestamp) then
-            fresh = fresh + 1
-        end
+    local keys, keysOk = firebaseGet("/candidatePool.json?shallow=true")
+    if not keysOk then
+        return nil
     end
-    return remaining, fresh
+    local count = 0
+    for _ in pairs(type(keys) == "table" and keys or {}) do
+        count = count + 1
+    end
+    return count
 end
 
 local function refillCandidatePool()
@@ -668,28 +710,29 @@ local function refillCandidatePool()
         return false, "refill_stopped"
     end
 
-    local pool, poolReadOk = firebaseGet("/candidatePool.json")
-    if not poolReadOk then
+    local leaseId, leaseReason = acquireRefillLease()
+    if not leaseId then
+        runtime.refillRunning = false
+        return false, leaseReason
+    end
+
+    local poolSize = pruneCandidatePool()
+    if poolSize == nil then
+        releaseRefillLease(leaseId)
         runtime.refillRunning = false
         return false, "pool_unavailable"
     end
-    pool = type(pool) == "table" and pool or {}
-    local poolSize, freshCount = pruneCandidatePool(pool)
-    if freshCount >= CANDIDATE_POOL_TARGET then
+    if poolSize >= CANDIDATE_POOL_TARGET then
+        releaseRefillLease(leaseId)
         runtime.refillRunning = false
         return true, "pool_ready"
     end
 
     local cooldownUntil = tonumber(firebaseGet("/candidatePoolMeta/cooldownUntil.json") or 0) or 0
     if cooldownUntil > now() then
+        releaseRefillLease(leaseId)
         runtime.refillRunning = false
         return false, "cooldown"
-    end
-
-    local leaseId, leaseReason = acquireRefillLease()
-    if not leaseId then
-        runtime.refillRunning = false
-        return false, leaseReason
     end
 
     local cursorValue = firebaseGet("/candidatePoolMeta/nextCursor.json")
@@ -734,12 +777,8 @@ local function refillCandidatePool()
             if writeCount < writeBudget and jobId ~= "" and jobId ~= game.JobId
                 and tonumber(server.playing or 0) < tonumber(server.maxPlayers or 0) then
                 writes[jobId] = {
-                    jobId = jobId,
-                    placeId = game.PlaceId,
                     playing = tonumber(server.playing or 0),
-                    maxPlayers = tonumber(server.maxPlayers or 0),
                     discoveredAt = now(),
-                    discoveredBy = SEARCHER_ID,
                 }
                 writeCount = writeCount + 1
             end
@@ -753,8 +792,10 @@ local function refillCandidatePool()
 
         cursor = type(page.nextPageCursor) == "string" and page.nextPageCursor ~= ""
             and page.nextPageCursor or nil
-        firebaseWrite("PUT", "/candidatePoolMeta/nextCursor.json", cursor or "")
-        firebaseWrite("PUT", "/candidatePoolMeta/lastRefillAt.json", now())
+        firebaseWrite("PATCH", "/candidatePoolMeta.json", {
+            nextCursor = cursor or "",
+            lastRefillAt = now(),
+        })
         if not cursor then
             firebaseWrite("PUT", "/candidatePoolMeta/cooldownUntil.json", now() + 20)
             break
@@ -766,31 +807,61 @@ local function refillCandidatePool()
     return refillOk, refillReason
 end
 
-local function prepareFromCandidatePool(preparationGeneration)
-    local pool, poolOk = firebaseGet("/candidatePool.json")
-    local ownRecent, ownRecentOk = firebaseGet("/recentServers/" .. SEARCHER_ID .. ".json")
-    local fleetRecent, fleetRecentOk = firebaseGet("/fleetRecent.json")
-    if not poolOk or not ownRecentOk or not fleetRecentOk then
-        return false, "coordination_unavailable"
-    end
-    pool = type(pool) == "table" and pool or {}
-    ownRecent = type(ownRecent) == "table" and ownRecent or {}
-    fleetRecent = type(fleetRecent) == "table" and fleetRecent or {}
-
+local function refreshCandidateCache()
     local timestamp = now()
-    local candidates = {}
-    for jobId, candidate in pairs(pool) do
-        local fleetRecord = fleetRecent[jobId]
-        local fleetCheckedAt = type(fleetRecord) == "table" and fleetRecord.checkedAt or fleetRecord
-        local ownVisitedAt = tonumber(ownRecent[jobId] or 0) or 0
-        local fleetVisitedAt = tonumber(fleetCheckedAt or 0) or 0
+    local cacheSize = #runtime.candidateCache
+    if cacheSize >= CANDIDATE_CACHE_LOW_WATER
+        and timestamp - runtime.candidateCacheAt < CANDIDATE_CACHE_SECONDS then
+        return true
+    end
+
+    local cacheSeed = stableCandidateScore(runtime.generation)
+    local startKey = string.format(
+        "%x%07x",
+        cacheSeed % 16,
+        math.floor(cacheSeed / 16) % 268435456
+    )
+    local query = string.format(
+        '/candidatePool.json?orderBy="$key"&startAt="%s"&limitToFirst=%d',
+        startKey,
+        CANDIDATE_QUERY_LIMIT
+    )
+    local pool, poolOk = firebaseGet(query)
+    if not poolOk then
+        return false
+    end
+    local poolCount = 0
+    for _ in pairs(type(pool) == "table" and pool or {}) do
+        poolCount = poolCount + 1
+    end
+    if poolCount < CANDIDATE_CACHE_LOW_WATER then
+        local wrapped, wrappedOk = firebaseGet(
+            '/candidatePool.json?orderBy="$key"&limitToFirst=' .. tostring(CANDIDATE_QUERY_LIMIT)
+        )
+        if not wrappedOk then
+            return false
+        end
+        for jobId, candidate in pairs(type(wrapped) == "table" and wrapped or {}) do
+            if poolCount >= CANDIDATE_QUERY_LIMIT then
+                break
+            end
+            if type(pool) ~= "table" then
+                pool = {}
+            end
+            if pool[jobId] == nil then
+                pool[jobId] = candidate
+                poolCount = poolCount + 1
+            end
+        end
+    end
+
+    local cached = {}
+    for jobId, candidate in pairs(type(pool) == "table" and pool or {}) do
         if candidateIsFresh(candidate, timestamp)
             and jobId ~= game.JobId
             and jobId ~= runtime.previousJobId
-            and jobId ~= runtime.expectedJobId
-            and ownVisitedAt < timestamp - OWN_RECENT_TTL_SECONDS
-            and fleetVisitedAt < timestamp - FLEET_RECENT_TTL_SECONDS then
-            table.insert(candidates, {
+            and jobId ~= runtime.expectedJobId then
+            table.insert(cached, {
                 jobId = jobId,
                 candidate = candidate,
                 score = stableCandidateScore(jobId),
@@ -798,36 +869,64 @@ local function prepareFromCandidatePool(preparationGeneration)
             })
         end
     end
-    table.sort(candidates, function(a, b)
+    table.sort(cached, function(a, b)
         if a.score ~= b.score then
             return a.score < b.score
         end
         return a.playing < b.playing
     end)
+    runtime.candidateCache = cached
+    runtime.candidateCacheAt = timestamp
+    return true
+end
 
-    for index = 1, math.min(#candidates, CANDIDATE_RESERVATION_ATTEMPTS) do
-        local selected = candidates[index]
-        local reserved, reserveReason = reserveServer(selected.jobId)
-        if reserved then
-            if runtime.stopBackground or runtime.holdPosition or not runtimeIsCurrent()
-                or runtime.preparationGeneration ~= preparationGeneration then
-                releaseReservation(selected.jobId)
-                return false, "preparation_superseded"
+local function prepareFromCandidatePool(preparationGeneration)
+    if not refreshCandidateCache() then
+        return false, "coordination_unavailable"
+    end
+
+    local timestamp = now()
+    local attempted = 0
+    while #runtime.candidateCache > 0 and attempted < CANDIDATE_RESERVATION_ATTEMPTS do
+        local selected = table.remove(runtime.candidateCache, 1)
+        attempted = attempted + 1
+        local ownVisited, ownRecentOk = firebaseGet(
+            "/recentServers/" .. SEARCHER_ID .. "/" .. tostring(selected.jobId) .. ".json"
+        )
+        local fleetRecord, fleetRecentOk = firebaseGet(
+            "/fleetRecent/" .. tostring(selected.jobId) .. ".json"
+        )
+        if not ownRecentOk or not fleetRecentOk then
+            return false, "coordination_unavailable"
+        end
+        local fleetCheckedAt = type(fleetRecord) == "table" and fleetRecord.checkedAt or fleetRecord
+        local ownVisitedAt = tonumber(ownVisited or 0) or 0
+        local fleetVisitedAt = tonumber(fleetCheckedAt or 0) or 0
+        if candidateIsFresh(selected.candidate, timestamp)
+            and ownVisitedAt < timestamp - OWN_RECENT_TTL_SECONDS
+            and fleetVisitedAt < timestamp - FLEET_RECENT_TTL_SECONDS then
+            local reserved, reserveReason = reserveServer(selected.jobId)
+            if reserved then
+                if runtime.stopBackground or runtime.holdPosition or not runtimeIsCurrent()
+                    or runtime.preparationGeneration ~= preparationGeneration then
+                    releaseReservation(selected.jobId)
+                    return false, "preparation_superseded"
+                end
+                runtime.nextHop = {
+                    jobId = selected.jobId,
+                    reservedAt = timestamp,
+                    reservedAtClock = os.clock(),
+                    expiresAt = timestamp + RESERVATION_TTL_SECONDS,
+                    source = "firebase-cache",
+                    reservationResult = reserveReason,
+                }
+                firebaseWrite("DELETE", candidatePath(selected.jobId))
+                print("[Vichop/Searcher] Prepared", shortJobId(selected.jobId), runtime.nextHop.source)
+                return true, "prepared"
             end
-            runtime.nextHop = {
-                jobId = selected.jobId,
-                reservedAt = timestamp,
-                reservedAtClock = os.clock(),
-                expiresAt = timestamp + RESERVATION_TTL_SECONDS,
-                source = selected.candidate.discoveredBy == SEARCHER_ID and "local" or "firebase",
-                reservationResult = reserveReason,
-            }
-            firebaseWrite("DELETE", candidatePath(selected.jobId))
-            print("[Vichop/Searcher] Prepared", shortJobId(selected.jobId), runtime.nextHop.source)
-            return true, "prepared"
         end
     end
-    return false, #candidates == 0 and "pool_empty" or "reservation_race"
+    return false, attempted == 0 and "pool_empty" or "reservation_race"
 end
 
 local function ensureNextHop()
@@ -917,7 +1016,6 @@ local function publishSpawn(monster, level)
             updated.searcherHeartbeatAt = timestamp
             updated.lastSeenAt = timestamp
             updated.updatedAt = timestamp
-            updated.note = monster:GetFullName()
             updated.searcherDeparting = true
             updated.searcherDepartureRequestedAt = tonumber(updated.searcherDepartureRequestedAt) or timestamp
             updated.slotReadyAt = tonumber(updated.slotReadyAt) or 0
@@ -938,9 +1036,7 @@ local function publishSpawn(monster, level)
             updatedAt = timestamp,
             lastSeenAt = timestamp,
             searcherHeartbeatAt = timestamp,
-            source = PLAYER.Name,
             searcherId = SEARCHER_ID,
-            note = monster:GetFullName(),
             viciousLevel = level,
             searcherDeparting = true,
             searcherDepartureRequestedAt = timestamp,
@@ -994,7 +1090,6 @@ local function heartbeatJob(monster, level)
         updated.updatedAt = timestamp
         updated.lastSeenAt = timestamp
         updated.searcherHeartbeatAt = timestamp
-        updated.note = monster:GetFullName()
         if level then
             updated.viciousLevel = level
         end
@@ -1210,19 +1305,22 @@ local function validateArrivedServer(teleportContext)
         return false, "arrived in a different server than the prepared destination"
     end
 
-    local ownRecent, ownRecentOk = firebaseGet("/recentServers/" .. SEARCHER_ID .. ".json")
-    local fleetRecent, fleetRecentOk = firebaseGet("/fleetRecent.json")
+    local ownRecent, ownRecentOk = firebaseGet(
+        "/recentServers/" .. SEARCHER_ID .. "/" .. tostring(game.JobId) .. ".json"
+    )
+    local fleetRecent, fleetRecentOk = firebaseGet(
+        "/fleetRecent/" .. tostring(game.JobId) .. ".json"
+    )
     if not ownRecentOk or not fleetRecentOk then
         return false, "recent-server history unavailable"
     end
 
     local timestamp = now()
-    local ownVisitedAt = tonumber(type(ownRecent) == "table" and ownRecent[game.JobId] or 0) or 0
+    local ownVisitedAt = tonumber(ownRecent or 0) or 0
     if ownVisitedAt >= timestamp - OWN_RECENT_TTL_SECONDS then
         return false, "server was recently checked by this searcher"
     end
-    local fleetRecord = type(fleetRecent) == "table" and fleetRecent[game.JobId] or nil
-    local fleetVisitedAt = type(fleetRecord) == "table" and fleetRecord.checkedAt or fleetRecord
+    local fleetVisitedAt = type(fleetRecent) == "table" and fleetRecent.checkedAt or fleetRecent
     if tonumber(fleetVisitedAt or 0) >= timestamp - FLEET_RECENT_TTL_SECONDS then
         return false, "server was recently checked by the fleet"
     end
@@ -1238,29 +1336,53 @@ end
 
 local function expireOldData()
     local timestamp = now()
-    local activeServers = firebaseGet("/activeServers.json") or {}
-    local removed = 0
-    for jobId, reservation in pairs(activeServers) do
-        if removed >= 12 then
-            break
-        end
-        if not reservationIsFresh(reservation, timestamp) then
-            if atomicDeleteIf(reservationPath(jobId), function(current)
-                return not reservationIsFresh(current, now())
-            end) then
-                removed = removed + 1
-            end
+    local ownRecentPath = string.format(
+        '/recentServers/%s.json?orderBy="$value"&endAt=%d&limitToFirst=%d',
+        SEARCHER_ID,
+        timestamp - OWN_RECENT_TTL_SECONDS,
+        CLEANUP_BATCH_SIZE
+    )
+    local ownRecent = firebaseGet(ownRecentPath) or {}
+    for jobId, visitedAt in pairs(ownRecent) do
+        if tonumber(visitedAt or 0) <= timestamp - OWN_RECENT_TTL_SECONDS then
+            atomicDeleteIf("/recentServers/" .. SEARCHER_ID .. "/" .. tostring(jobId) .. ".json", function(current)
+                return tonumber(current or 0) <= now() - OWN_RECENT_TTL_SECONDS
+            end)
         end
     end
 
-    local jobs = firebaseGet("/jobs.json") or {}
+    local cleanupLeaseId = acquireCleanupLease()
+    if not cleanupLeaseId then
+        return
+    end
+
+    local activePath = string.format(
+        '/activeServers.json?orderBy="heartbeatAt"&endAt=%d&limitToFirst=%d',
+        timestamp - RESERVATION_TTL_SECONDS,
+        CLEANUP_BATCH_SIZE
+    )
+    local activeServers = firebaseGet(activePath) or {}
+    for jobId in pairs(activeServers) do
+        atomicDeleteIf(reservationPath(jobId), function(current)
+            return not reservationIsFresh(current, now())
+        end)
+    end
+
+    local jobsPath = string.format(
+        '/jobs.json?orderBy="updatedAt"&endAt=%d&limitToFirst=%d',
+        timestamp - JOB_STALE_SECONDS,
+        CLEANUP_BATCH_SIZE
+    )
+    local jobs = firebaseGet(jobsPath) or {}
     for jobId, job in pairs(jobs) do
         local status = type(job) == "table" and job.status or nil
-        local lastSeen = type(job) == "table" and tonumber(job.lastSeenAt or job.updatedAt or 0) or 0
-        if status == "spawned" and lastSeen < timestamp - JOB_STALE_SECONDS then
+        local updatedAt = type(job) == "table" and tonumber(job.updatedAt or 0) or 0
+        if status == "spawned" then
             atomicMutate(jobPath(jobId), function(current)
-                local currentSeen = type(current) == "table" and tonumber(current.lastSeenAt or current.updatedAt or 0) or 0
-                if type(current) ~= "table" or current.status ~= "spawned" or currentSeen >= now() - JOB_STALE_SECONDS then
+                local currentSeen = type(current) == "table"
+                    and tonumber(current.lastSeenAt or current.updatedAt or 0) or 0
+                if type(current) ~= "table" or current.status ~= "spawned"
+                    or currentSeen >= now() - JOB_STALE_SECONDS then
                     return nil, "fresh_or_changed"
                 end
                 local updated = copyTable(current)
@@ -1269,28 +1391,68 @@ local function expireOldData()
                 updated.updatedAt = now()
                 return updated, "expired"
             end, 2)
-        end
-    end
-
-    local ownRecent = firebaseGet("/recentServers/" .. SEARCHER_ID .. ".json") or {}
-    for jobId, visitedAt in pairs(ownRecent) do
-        if tonumber(visitedAt or 0) < timestamp - OWN_RECENT_TTL_SECONDS then
-            atomicDeleteIf("/recentServers/" .. SEARCHER_ID .. "/" .. tostring(jobId) .. ".json", function(current)
-                return tonumber(current or 0) < now() - OWN_RECENT_TTL_SECONDS
+        elseif status == "claimed" and tonumber(job.claimExpiresAt or 0) <= timestamp then
+            atomicMutate(jobPath(jobId), function(current)
+                if type(current) ~= "table" or current.status ~= "claimed"
+                    or tonumber(current.claimExpiresAt or 0) > now() then
+                    return nil, "fresh_or_changed"
+                end
+                local updated = copyTable(current)
+                if tonumber(current.searcherHeartbeatAt or current.lastSeenAt or 0)
+                    >= now() - JOB_STALE_SECONDS then
+                    updated.status = "spawned"
+                    updated.claimedBy = nil
+                    updated.killer = nil
+                    updated.claimedAt = nil
+                    updated.claimHeartbeatAt = nil
+                    updated.claimExpiresAt = nil
+                    updated.reason = "stale_claim_released"
+                else
+                    updated.status = "expired"
+                    updated.reason = "stale_claim_and_job"
+                end
+                updated.updatedAt = now()
+                return updated, "recovered"
+            end, 2)
+        elseif status == "resolving" and updatedAt <= timestamp - RESOLUTION_STALE_SECONDS then
+            atomicMutate(jobPath(jobId), function(current)
+                if type(current) ~= "table" or current.status ~= "resolving"
+                    or tonumber(current.updatedAt or 0) > now() - RESOLUTION_STALE_SECONDS then
+                    return nil, "fresh_or_changed"
+                end
+                local updated = copyTable(current)
+                updated.status = "failed"
+                updated.failureReason = "stale_reward_resolution"
+                updated.updatedAt = now()
+                return updated, "failed"
+            end, 2)
+        elseif (status == "killed" or status == "failed" or status == "expired" or status == "missing")
+            and updatedAt <= timestamp - TERMINAL_JOB_RETENTION_SECONDS then
+            atomicDeleteIf(jobPath(jobId), function(current)
+                return type(current) == "table"
+                    and (current.status == "killed" or current.status == "failed"
+                        or current.status == "expired" or current.status == "missing")
+                    and tonumber(current.updatedAt or 0) <= now() - TERMINAL_JOB_RETENTION_SECONDS
             end)
         end
     end
 
-    local fleetRecent = firebaseGet("/fleetRecent.json") or {}
+    local fleetPath = string.format(
+        '/fleetRecent.json?orderBy="checkedAt"&endAt=%d&limitToFirst=%d',
+        timestamp - FLEET_RECENT_RETENTION_SECONDS,
+        CLEANUP_BATCH_SIZE
+    )
+    local fleetRecent = firebaseGet(fleetPath) or {}
     for jobId, record in pairs(fleetRecent) do
         local checkedAt = type(record) == "table" and record.checkedAt or record
-        if tonumber(checkedAt or 0) < timestamp - OWN_RECENT_TTL_SECONDS then
+        if tonumber(checkedAt or 0) <= timestamp - FLEET_RECENT_RETENTION_SECONDS then
             atomicDeleteIf("/fleetRecent/" .. tostring(jobId) .. ".json", function(current)
                 local currentCheckedAt = type(current) == "table" and current.checkedAt or current
-                return tonumber(currentCheckedAt or 0) < now() - OWN_RECENT_TTL_SECONDS
+                return tonumber(currentCheckedAt or 0) <= now() - FLEET_RECENT_RETENTION_SECONDS
             end)
         end
     end
+    releaseCleanupLease(cleanupLeaseId)
 end
 
 local function scheduleCleanup()
